@@ -682,11 +682,33 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
         except Exception:
             pass
 
-        # Franchise catalogs are intentionally NOT exposed as top-level manifest
-        # catalogs. Nuvio loads them through the dedicated Ultimate Collection
-        # folder below; advertising every franchise here also makes each one show
-        # up as a separate home-screen row, duplicating the curated collection.
-        # The catalog endpoint still handles franchise_<id> requests directly.
+        # Nuvio Mobile currently needs collection-referenced addon catalogs to be
+        # declared in the addon's manifest. Expose each database-backed franchise
+        # catalog here so collection tabs can resolve to this installed addon.
+        # Users can disable these entries as standalone home catalogs in Nuvio;
+        # they remain available as sources inside the single Ultimate Collection.
+        try:
+            await _ensure_franchise_metadata_index()
+            franchise_groups = await _get_available_franchise_groups(token_data)
+            for group in franchise_groups:
+                franchise_catalog_id = f"franchise_{group['id']}"
+                if any(
+                    item.get("id") == franchise_catalog_id and item.get("type") == "movie"
+                    for item in catalogs
+                ):
+                    continue
+                catalogs.append({
+                    "type": "movie",
+                    "id": franchise_catalog_id,
+                    "name": group.get("name") or f"Collection {group['id']}",
+                    "extra": [
+                        {"name": "search", "isRequired": False},
+                        {"name": "skip"},
+                    ],
+                    "extraSupported": ["search", "skip"],
+                })
+        except Exception as exc:
+            LOGGER.warning(f"Could not register franchise catalogs in manifest: {exc}")
 
         try:
             order = await db.get_catalog_order()
@@ -704,7 +726,8 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
             if hidden:
                 catalogs = [
                     c for c in catalogs
-                    if c.get("id") not in hidden and f"{c.get('id')}::{c.get('type')}" not in hidden
+                    if str(c.get("id", "")).startswith("franchise_")
+                    or (c.get("id") not in hidden and f"{c.get('id')}::{c.get('type')}" not in hidden)
                 ]
         except Exception:
             pass

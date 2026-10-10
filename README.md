@@ -148,6 +148,7 @@ The app is great for personal, single-user use, but it's intentionally lighter t
 * **File:** The Telegram bot automatically attaches the downloadable `nuvio_collection.json` document on `/start` or subscription approval.
 * Import the URL or JSON file into **Nuvio (Settings ⚙️ → Collections → Import)** to display the **Streaming Services** row and a separate **Collections → The Ultimate Collection** row on the Nuvio home screen.
 * **Dynamic Ultimate Collection:** franchise tabs are built from TMDb collection metadata for movies that are actually stored in Telegram. A franchise appears when at least one playable title from it exists in the database, and its tab returns only titles available in that database—not the full external franchise list.
+* **Nuvio Mobile compatibility:** collection-only franchise catalogs are declared in `manifest.json` because Nuvio Mobile currently requires referenced addon catalogs to be present in the manifest. To avoid duplicate standalone rows, disable the `franchise_*` entries in Nuvio's Home Catalog settings; do not remove them from the manifest or the tabs may stop resolving.
 * Existing movie records are indexed for franchise metadata on the first manifest/collection request. The initial batch is handled inline and the remaining records are processed in the background; re-import/refresh the generated collection after that first backfill completes to include every detected franchise.
 
 > ⚠️ **Important for Server Hosts:**  
