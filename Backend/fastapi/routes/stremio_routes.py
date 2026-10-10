@@ -42,7 +42,7 @@ PAGE_SIZE = 15
 # process, then intersect with the caller's accessible Telegram records.
 _TMDB_TRENDING_CACHE: dict[tuple[str, str], tuple[float, list[int]]] = {}
 _TMDB_TRENDING_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
-_TMDB_TRENDING_CACHE_TTL = 15 * 60
+_TMDB_TRENDING_CACHE_TTL = 5 * 60
 _TMDB_TRENDING_PAGES = 5  # 100 candidates; filtering still happens against local DB.
 
 def _tmdb_api_key() -> str:

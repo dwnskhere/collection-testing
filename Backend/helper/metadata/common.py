@@ -15,6 +15,11 @@ from Backend.logger import LOGGER
 CINEMETA_THRESHOLD = 0.60
 TMDB_THRESHOLD = 0.55
 TVDB_THRESHOLD = 0.55
+# Series filenames often contain meaningful extra words; a partial match such as
+# "Doctor X Mafia in White" -> "Doctor White" must not merge episodes into the
+# wrong series document. Series search checks aliases first, then uses this higher
+# minimum confidence. Movie thresholds intentionally remain unchanged.
+SERIES_TITLE_THRESHOLD = 0.72
 KITSU_THRESHOLD = 0.55
 STRONG_MATCH = 0.92
 ALT_TITLE_LOOKUPS = 5
