@@ -1320,11 +1320,6 @@ class Database:
                 is_anime=metadata_info.get('is_anime', False),
                 original_language=metadata_info.get('original_language'),
                 origin_country=metadata_info.get('origin_country', []) or [],
-                tmdb_collection_id=metadata_info.get('tmdb_collection_id'),
-                tmdb_collection_name=metadata_info.get('tmdb_collection_name'),
-                tmdb_collection_poster=metadata_info.get('tmdb_collection_poster'),
-                tmdb_collection_backdrop=metadata_info.get('tmdb_collection_backdrop'),
-                tmdb_collection_checked=metadata_info.get('tmdb_collection_checked'),
                 telegram=[quality_detail]
             )
             return await self.update_movie(media, status)
@@ -1523,27 +1518,6 @@ class Database:
             existing_movie["tmdb_id"] = tmdb_id
         if kitsu_id and not existing_movie.get("kitsu_id"):
             existing_movie["kitsu_id"] = kitsu_id
-        # Preserve franchise metadata when the incoming source does not provide
-        # it, but update it when fresh TMDb details are available.
-        if movie_dict.get("tmdb_collection_checked") is True:
-            for collection_field in (
-                "tmdb_collection_id",
-                "tmdb_collection_name",
-                "tmdb_collection_poster",
-                "tmdb_collection_backdrop",
-            ):
-                existing_movie[collection_field] = movie_dict.get(collection_field)
-            existing_movie["tmdb_collection_checked"] = True
-        else:
-            for collection_field in (
-                "tmdb_collection_id",
-                "tmdb_collection_name",
-                "tmdb_collection_poster",
-                "tmdb_collection_backdrop",
-            ):
-                value = movie_dict.get(collection_field)
-                if value not in (None, "", [], {}):
-                    existing_movie[collection_field] = value
         if movie_dict.get("is_anime"):
             existing_movie["is_anime"] = True
 

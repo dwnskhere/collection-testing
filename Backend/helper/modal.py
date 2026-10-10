@@ -94,10 +94,3 @@ class MovieSchema(BaseModel):
     watch_providers: Optional[List[str]] = Field(default_factory=list)
     auto_tags: Optional[List[str]] = Field(default_factory=list)
     auto_catalog: Optional[dict] = None
-    # TMDb franchise/collection metadata. These fields are optional so existing
-    # media documents remain compatible and can be backfilled in the background.
-    tmdb_collection_id: Optional[int] = None
-    tmdb_collection_name: Optional[str] = None
-    tmdb_collection_poster: Optional[str] = None
-    tmdb_collection_backdrop: Optional[str] = None
-    tmdb_collection_checked: Optional[bool] = None

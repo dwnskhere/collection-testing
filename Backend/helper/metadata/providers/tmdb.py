@@ -238,11 +238,6 @@ def build_movie_payload(movie, quality, encoded_string) -> dict:
     title = movie.title or getattr(movie, "original_title", "") or ""
     eng = title
     orig = getattr(movie, "original_title", None) or title
-    collection = getattr(movie, "belongs_to_collection", None)
-    collection_id = getattr(collection, "id", None) if collection else None
-    collection_name = getattr(collection, "name", None) if collection else None
-    collection_poster = getattr(collection, "poster_path", None) if collection else None
-    collection_backdrop = getattr(collection, "backdrop_path", None) if collection else None
     payload = {
         "tmdb_id": movie.id,
         "imdb_id": getattr(getattr(movie, "external_ids", None), "imdb_id", None),
@@ -263,14 +258,6 @@ def build_movie_payload(movie, quality, encoded_string) -> dict:
         "genres": [g.name for g in (movie.genres or [])],
         "original_language": getattr(movie, "original_language", None),
         "origin_country": _tmdb_country_codes(movie),
-        # Keep the official TMDb collection identity with the Telegram media
-        # record. The Nuvio collection generator uses it to build DB-only
-        # franchise tabs rather than showing every title from an external list.
-        "tmdb_collection_id": collection_id,
-        "tmdb_collection_name": collection_name,
-        "tmdb_collection_poster": format_tmdb_image(collection_poster),
-        "tmdb_collection_backdrop": format_tmdb_image(collection_backdrop, "original"),
-        "tmdb_collection_checked": True,
         "quality": quality,
         "encoded_string": encoded_string,
     }

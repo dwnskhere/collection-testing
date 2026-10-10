@@ -144,12 +144,12 @@ The app is great for personal, single-user use, but it's intentionally lighter t
 * Add this manifest URL into **Stremio Addons** or **Nuvio Addons**. It serves as the primary streaming engine for both players.
 
 ### 2. Nuvio Collection & Logo Buttons (Optional)
+
+* **Trending Now:** the `trending_movies` and `trending_series` catalogs use TMDB's daily Trending API for rank order, then intersect those TMDB IDs with accessible Telegram-Stremio database records. A title that is trending on TMDB but missing from the Telegram database is never shown. These results are cached for 15 minutes; during a TMDB outage, the last successful cached ranking is used when available.
+* **Latest / Popular:** remain database-based. Latest is ordered by `updated_on`; Popular is ordered by stored `rating`. They are deliberately not presented as TMDB Trending.
 * **URL:** `https://<YOUR_DOMAIN>/stremio/<TOKEN>/nuvio-collection.json`
 * **File:** The Telegram bot automatically attaches the downloadable `nuvio_collection.json` document on `/start` or subscription approval.
-* Import the URL or JSON file into **Nuvio (Settings ⚙️ → Collections → Import)** to display the **Streaming Services** row and a separate **Collections → The Ultimate Collection** row on the Nuvio home screen.
-* **Dynamic Ultimate Collection:** franchise tabs are built from TMDb collection metadata for movies that are actually stored in Telegram. A franchise appears when at least one playable title from it exists in the database, and its tab returns only titles available in that database—not the full external franchise list.
-* **Nuvio Mobile compatibility:** collection-only franchise catalogs are declared in `manifest.json` because Nuvio Mobile currently requires referenced addon catalogs to be present in the manifest. To avoid duplicate standalone rows, disable the `franchise_*` entries in Nuvio's Home Catalog settings; do not remove them from the manifest or the tabs may stop resolving.
-* Existing movie records are indexed for franchise metadata on the first manifest/collection request. The initial batch is handled inline and the remaining records are processed in the background; re-import/refresh the generated collection after that first backfill completes to include every detected franchise.
+* Import the URL or JSON file into **Nuvio (Settings ⚙️ → Collections → Import)** to display horizontal **Landscape Logo Buttons** (*Netflix*, *JioHotstar*, *Prime Video*, *Apple TV*, *Bollywood*, *Anime*, *Marvel*, *Star Wars*) on the Nuvio home screen!
 
 > ⚠️ **Important for Server Hosts:**  
 > For Nuvio collections to populate platform-specific titles (instead of falling back to default latest movies/series), make sure to enable the **Auto Catalogs** (**Netflix, Hotstar, Prime Video, Apple TV, Bollywood, etc.**) under **Dashboard → Catalogs** and click **Sync**.

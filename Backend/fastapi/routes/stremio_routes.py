@@ -1,12 +1,12 @@
 import asyncio
 import re
 import time
-from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote, unquote
 
 import PTN
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.templating import Jinja2Templates
 from pyrogram.enums import ChatMemberStatus
@@ -22,8 +22,6 @@ from Backend.helper.fanart import fanart_artwork
 from Backend.helper.global_search import global_search, is_global_search_enabled
 from Backend.helper.metadata.providers.cinemeta import get_detail, get_season
 from Backend.helper.metadata import resolve_cover_url, COMBINED_SEASON, COMBINED_EPISODE_BASE
-from Backend.helper.metadata.common import format_tmdb_image
-from Backend.helper.metadata.providers.tmdb import details as fetch_tmdb_details, tmdb_api_key
 from Backend.helper.split_files import parse_combined_episodes, combined_name_key
 from Backend.helper.settings_manager import SettingsManager
 from Backend.helper.subtitles import get_subtitles_for, stremio_subtitle_entries
@@ -37,6 +35,154 @@ templates = Jinja2Templates(directory="Backend/fastapi/templates")
 ADDON_NAME = "Telegram"
 ADDON_VERSION = __version__
 PAGE_SIZE = 15
+
+# TMDB trending is external and changes on a much shorter window than the
+# database's Latest/Popular listings. Cache the ordered TMDB IDs globally per
+# process, then intersect with the caller's accessible Telegram records.
+_TMDB_TRENDING_CACHE: dict[tuple[str, str], tuple[float, list[int]]] = {}
+_TMDB_TRENDING_LOCKS: dict[tuple[str, str], asyncio.Lock] = {}
+_TMDB_TRENDING_CACHE_TTL = 15 * 60
+_TMDB_TRENDING_PAGES = 5  # 100 candidates; filtering still happens against local DB.
+
+def _tmdb_api_key() -> str:
+    try:
+        key = SettingsManager.current().tmdb_api
+        if key:
+            return str(key)
+    except Exception:
+        pass
+    return str(getattr(Telegram, "TMDB_API", "") or "")
+
+async def _get_tmdb_trending_ids(media_type: str, time_window: str = "day") -> list[int]:
+    """Return TMDB-ranked movie/TV IDs for the selected daily/weekly window."""
+    if media_type not in {"movie", "tv"} or time_window not in {"day", "week"}:
+        return []
+    api_key = _tmdb_api_key()
+    if not api_key:
+        LOGGER.warning("TMDB Trending is unavailable: TMDB_API is not configured")
+        return []
+
+    cache_key = (media_type, time_window)
+    now = time.monotonic()
+    cached = _TMDB_TRENDING_CACHE.get(cache_key)
+    if cached and now - cached[0] < _TMDB_TRENDING_CACHE_TTL:
+        return list(cached[1])
+    stale_cache = cached
+
+    lock = _TMDB_TRENDING_LOCKS.setdefault(cache_key, asyncio.Lock())
+    async with lock:
+        now = time.monotonic()
+        cached = _TMDB_TRENDING_CACHE.get(cache_key)
+        if cached and now - cached[0] < _TMDB_TRENDING_CACHE_TTL:
+            return list(cached[1])
+
+        async def _fetch_page(client: httpx.AsyncClient, page: int):
+            url = f"https://api.themoviedb.org/3/trending/{media_type}/{time_window}"
+            response = await client.get(
+                url,
+                params={"api_key": api_key, "language": "en-US", "page": page},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            results = payload.get("results") or []
+            return page, results
+
+        try:
+            timeout = httpx.Timeout(8.0, connect=4.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                responses = await asyncio.gather(
+                    *(_fetch_page(client, page) for page in range(1, _TMDB_TRENDING_PAGES + 1)),
+                    return_exceptions=True,
+                )
+            page_results = {}
+            for response in responses:
+                if isinstance(response, Exception):
+                    status_code = getattr(getattr(response, "response", None), "status_code", None)
+                    detail = f"HTTP {status_code}" if status_code else type(response).__name__
+                    # Do not log exception URLs: TMDB v3 keys are query parameters.
+                    LOGGER.warning(f"TMDB Trending page request failed ({media_type}/{time_window}): {detail}")
+                    continue
+                page, results = response
+                page_results[page] = results
+
+            # During partial outages, prefer a complete stale ranking when available.
+            # Otherwise return the contiguous successful prefix without caching it,
+            # so the next request can retry the missing pages.
+            if len(page_results) < _TMDB_TRENDING_PAGES and stale_cache:
+                return list(stale_cache[1])
+
+            # Preserve rank integrity: if page 2 failed, do not pretend page 3's
+            # results are ranked above the missing page. Use only contiguous pages.
+            ordered_ids: list[int] = []
+            seen: set[int] = set()
+            for page in range(1, _TMDB_TRENDING_PAGES + 1):
+                if page not in page_results:
+                    break
+                for result in page_results[page]:
+                    try:
+                        tmdb_id = int(result.get("id"))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if tmdb_id > 0 and tmdb_id not in seen:
+                        seen.add(tmdb_id)
+                        ordered_ids.append(tmdb_id)
+
+            if ordered_ids:
+                if len(page_results) == _TMDB_TRENDING_PAGES:
+                    _TMDB_TRENDING_CACHE[cache_key] = (time.monotonic(), ordered_ids)
+                return ordered_ids
+            # On total API failure, preserve stale successful data and retry later.
+            return list(stale_cache[1]) if stale_cache else []
+        except Exception as exc:
+            status_code = getattr(getattr(exc, "response", None), "status_code", None)
+            detail = f"HTTP {status_code}" if status_code else type(exc).__name__
+            # Do not log exception URLs: TMDB v3 keys are query parameters.
+            LOGGER.warning(f"TMDB Trending request failed ({media_type}/{time_window}): {detail}")
+            # Serve stale data, if available, rather than reverting to DB Popular.
+            stale = _TMDB_TRENDING_CACHE.get(cache_key)
+            return list(stale[1]) if stale else []
+
+async def _get_db_matches_in_tmdb_order(
+    media_type: str, tmdb_ids: list[int], token_data: dict, genre_filter: str | None = None
+) -> list[dict]:
+    """Intersect TMDB-ranked IDs with accessible local documents, preserving TMDB order."""
+    if not tmdb_ids:
+        return []
+    collection_name = "tv" if media_type == "series" else "movie"
+    query_parts = [
+        {"tmdb_id": {"$in": tmdb_ids}},
+        _visibility_query(token_data),
+        _not_exclusive_clause(),
+    ]
+    if genre_filter:
+        query_parts.append({"genres": {"$in": [genre_filter]}})
+    query = _merge_filters(*query_parts)
+
+    by_tmdb_id: dict[int, dict] = {}
+    storage_keys = [key for key in db.dbs if str(key).startswith("storage_")]
+    # Prefer later storage DBs first if duplicate records exist across DBs.
+    storage_keys.sort(key=lambda key: int(str(key).split("_", 1)[1]), reverse=True)
+    for db_key in storage_keys:
+        try:
+            cursor = db.dbs[db_key][collection_name].find(query)
+            async for item in cursor:
+                try:
+                    tmdb_id = int(item.get("tmdb_id"))
+                except (TypeError, ValueError):
+                    continue
+                if tmdb_id in by_tmdb_id:
+                    continue
+                if not _token_can_view(
+                    item.get("visibility") or "public",
+                    item.get("allowed_tokens") or [],
+                    token_data,
+                ):
+                    continue
+                by_tmdb_id[tmdb_id] = item
+        except Exception as exc:
+            LOGGER.warning(f"Could not read {collection_name} records from {db_key} for TMDB Trending: {exc}")
+
+    return [by_tmdb_id[tmdb_id] for tmdb_id in tmdb_ids if tmdb_id in by_tmdb_id]
 
 def _donation():
     text = "Enjoying Telegram Stremio?\nTap to support the developer"
@@ -57,15 +203,6 @@ def build_proxy_url(original_url: str) -> str | None:
 _membership_cache: dict = {}
 _MEMBERSHIP_TTL = 60
 _MEMBERSHIP_CACHE_MAX = 5000
-
-# Existing movie records are enriched once with TMDb franchise metadata. The
-# initial batch makes the feature useful quickly; the remainder runs in the
-# background and is persisted, so later imports do not repeat the API calls.
-_franchise_backfill_lock = asyncio.Lock()
-_franchise_backfill_task: asyncio.Task | None = None
-_franchise_initial_batch_done = False
-_FRANCHISE_INITIAL_BATCH_SIZE = 40
-_FRANCHISE_BACKFILL_CONCURRENCY = 8
 
 
 #----- Drop cached membership results for one user or all users
@@ -130,215 +267,6 @@ def _merge_filters(*filters) -> dict:
     if not parts:
         return {}
     return parts[0] if len(parts) == 1 else {"$and": parts}
-
-
-def _storage_database_keys() -> list[str]:
-    """Return storage database names in numeric order (excluding tracking)."""
-    keys = [key for key in db.dbs.keys() if str(key).startswith("storage_")]
-    return sorted(keys, key=lambda key: int(str(key).split("_", 1)[1]))
-
-
-def _obj_value(obj, key: str, default=None):
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return getattr(obj, key, default)
-
-
-async def _backfill_movie_franchise_metadata(max_items: int | None = None) -> int:
-    """Persist TMDb belongs_to_collection metadata for existing movie records."""
-    if not tmdb_api_key():
-        return 0
-
-    processed = 0
-    batch: list[tuple[object, dict]] = []
-
-    async def _save_collection(db_collection, movie_doc: dict) -> bool:
-        try:
-            tmdb_id = int(movie_doc.get("tmdb_id"))
-            details = await fetch_tmdb_details("movie", tmdb_id)
-            collection = _obj_value(details, "belongs_to_collection") if details else None
-
-            # Some legacy fallback metadata may contain a numeric placeholder
-            # rather than a real TMDb ID. Avoid assigning the wrong franchise
-            # if that numeric ID happens to resolve to a different movie.
-            if details:
-                db_titles = [
-                    movie_doc.get("title"),
-                    movie_doc.get("title_english"),
-                    movie_doc.get("original_title"),
-                ]
-                tmdb_titles = [
-                    _obj_value(details, "title"),
-                    _obj_value(details, "original_title"),
-                ]
-
-                def _normalize_title(value):
-                    return "".join(ch.lower() for ch in str(value or "") if ch.isalnum())
-
-                db_names = [_normalize_title(value) for value in db_titles if value]
-                tmdb_names = [_normalize_title(value) for value in tmdb_titles if value]
-                title_match = any(
-                    db_name and tmdb_name and (
-                        db_name == tmdb_name
-                        or SequenceMatcher(None, db_name, tmdb_name).ratio() >= 0.84
-                    )
-                    for db_name in db_names
-                    for tmdb_name in tmdb_names
-                )
-                db_year = movie_doc.get("release_year")
-                tmdb_release = _obj_value(details, "release_date")
-                tmdb_year = _obj_value(tmdb_release, "year") if tmdb_release else None
-                try:
-                    year_matches = not (db_year and tmdb_year) or abs(int(db_year) - int(tmdb_year)) <= 1
-                except (TypeError, ValueError):
-                    year_matches = True
-                if not title_match or not year_matches:
-                    collection = None
-
-            collection_id = _obj_value(collection, "id") if collection else None
-            try:
-                collection_id = int(collection_id) if collection_id is not None else None
-            except (TypeError, ValueError):
-                collection_id = None
-
-            update = {
-                "tmdb_collection_id": collection_id,
-                "tmdb_collection_name": _obj_value(collection, "name") if collection else None,
-                "tmdb_collection_poster": format_tmdb_image(
-                    _obj_value(collection, "poster_path")
-                ) if collection else "",
-                "tmdb_collection_backdrop": format_tmdb_image(
-                    _obj_value(collection, "backdrop_path"), "original"
-                ) if collection else "",
-                "tmdb_collection_checked": True,
-                "tmdb_collection_checked_at": datetime.utcnow(),
-            }
-            await db_collection.update_one({"_id": movie_doc["_id"]}, {"$set": update})
-            return True
-        except Exception as exc:
-            LOGGER.debug(
-                f"Franchise metadata lookup failed for tmdb_id={movie_doc.get('tmdb_id')}: {exc}"
-            )
-            return False
-
-    async def _flush_batch() -> None:
-        nonlocal processed
-        if not batch:
-            return
-        current = list(batch)
-        batch.clear()
-        await asyncio.gather(*(_save_collection(collection, doc) for collection, doc in current))
-        processed += len(current)
-
-    for db_key in _storage_database_keys():
-        collection = db.dbs[db_key]["movie"]
-        cursor = collection.find(
-            {
-                "tmdb_id": {"$exists": True, "$ne": None},
-                "tmdb_collection_checked": {"$ne": True},
-            },
-            {
-                "_id": 1,
-                "tmdb_id": 1,
-                "updated_on": 1,
-                "title": 1,
-                "title_english": 1,
-                "original_title": 1,
-                "release_year": 1,
-            },
-        ).sort("updated_on", -1)
-
-        async for movie_doc in cursor:
-            batch.append((collection, movie_doc))
-            if len(batch) >= _FRANCHISE_BACKFILL_CONCURRENCY:
-                await _flush_batch()
-                if max_items is not None and processed >= max_items:
-                    return processed
-
-        if batch:
-            await _flush_batch()
-            if max_items is not None and processed >= max_items:
-                return processed
-
-    return processed
-
-
-async def _ensure_franchise_metadata_index() -> None:
-    """Prime the index quickly, then let the remaining backfill run in background."""
-    global _franchise_backfill_task, _franchise_initial_batch_done
-    if not tmdb_api_key():
-        return
-
-    async with _franchise_backfill_lock:
-        if not _franchise_initial_batch_done:
-            await _backfill_movie_franchise_metadata(_FRANCHISE_INITIAL_BATCH_SIZE)
-            _franchise_initial_batch_done = True
-        if _franchise_backfill_task is None or _franchise_backfill_task.done():
-            _franchise_backfill_task = asyncio.create_task(_run_background_franchise_backfill())
-
-
-async def _run_background_franchise_backfill() -> None:
-    try:
-        processed = await _backfill_movie_franchise_metadata()
-        if processed:
-            LOGGER.info(f"Indexed TMDb franchise metadata for {processed} existing movies")
-    except Exception as exc:
-        LOGGER.warning(f"Background TMDb franchise indexing failed: {exc}")
-
-
-async def _get_available_franchise_groups(token_data: dict | None = None) -> list[dict]:
-    """Return franchises with at least one accessible, playable Telegram movie."""
-    token_data = token_data or {}
-    available = {}
-    media_filter = _merge_filters(
-        {
-            "tmdb_collection_id": {"$exists": True, "$ne": None},
-            "telegram.0": {"$exists": True},
-        },
-        _visibility_query(token_data),
-        _not_exclusive_clause(),
-    )
-
-    for db_key in _storage_database_keys():
-        cursor = db.dbs[db_key]["movie"].find(
-            media_filter,
-            {
-                "tmdb_collection_id": 1,
-                "tmdb_collection_name": 1,
-                "tmdb_collection_poster": 1,
-                "tmdb_collection_backdrop": 1,
-                "poster": 1,
-                "backdrop": 1,
-                "visibility": 1,
-                "allowed_tokens": 1,
-            },
-        )
-        async for movie_doc in cursor:
-            if not _token_can_view(
-                movie_doc.get("visibility") or "public",
-                movie_doc.get("allowed_tokens") or [],
-                token_data,
-            ):
-                continue
-            try:
-                collection_id = int(movie_doc.get("tmdb_collection_id"))
-            except (TypeError, ValueError):
-                continue
-            entry = available.setdefault(collection_id, {
-                "id": collection_id,
-                "name": movie_doc.get("tmdb_collection_name") or f"Collection {collection_id}",
-                "poster": movie_doc.get("tmdb_collection_poster") or movie_doc.get("poster") or "",
-                "backdrop": movie_doc.get("tmdb_collection_backdrop") or movie_doc.get("backdrop") or "",
-                "count": 0,
-            })
-            entry["count"] += 1
-            if not entry.get("poster"):
-                entry["poster"] = movie_doc.get("poster") or ""
-            if not entry.get("backdrop"):
-                entry["backdrop"] = movie_doc.get("backdrop") or ""
-
-    # A single available title is enough to make a franchise visible.
-    return sorted(available.values(), key=lambda item: (-item["count"], item["name"].casefold()))
 
 
 def _parse_stremio_id(id: str):
@@ -608,6 +536,26 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
         catalogs = [
             {
                 "type": "movie",
+                "id": "trending_movies",
+                "name": "TMDB Trending",
+                "extra": [
+                    {"name": "genre", "isRequired": False, "options": GENRES},
+                    {"name": "skip"}
+                ],
+                "extraSupported": ["genre", "skip"]
+            },
+            {
+                "type": "series",
+                "id": "trending_series",
+                "name": "TMDB Trending",
+                "extra": [
+                    {"name": "genre", "isRequired": False, "options": GENRES},
+                    {"name": "skip"}
+                ],
+                "extraSupported": ["genre", "skip"]
+            },
+            {
+                "type": "movie",
                 "id": "latest_movies",
                 "name": "Latest",
                 "extra": [
@@ -682,34 +630,6 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
         except Exception:
             pass
 
-        # Nuvio Mobile currently needs collection-referenced addon catalogs to be
-        # declared in the addon's manifest. Expose each database-backed franchise
-        # catalog here so collection tabs can resolve to this installed addon.
-        # Users can disable these entries as standalone home catalogs in Nuvio;
-        # they remain available as sources inside the single Ultimate Collection.
-        try:
-            await _ensure_franchise_metadata_index()
-            franchise_groups = await _get_available_franchise_groups(token_data)
-            for group in franchise_groups:
-                franchise_catalog_id = f"franchise_{group['id']}"
-                if any(
-                    item.get("id") == franchise_catalog_id and item.get("type") == "movie"
-                    for item in catalogs
-                ):
-                    continue
-                catalogs.append({
-                    "type": "movie",
-                    "id": franchise_catalog_id,
-                    "name": group.get("name") or f"Collection {group['id']}",
-                    "extra": [
-                        {"name": "search", "isRequired": False},
-                        {"name": "skip"},
-                    ],
-                    "extraSupported": ["search", "skip"],
-                })
-        except Exception as exc:
-            LOGGER.warning(f"Could not register franchise catalogs in manifest: {exc}")
-
         try:
             order = await db.get_catalog_order()
             token_order = (token_data.get("config") or {}).get("catalog_order") or []
@@ -726,8 +646,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
             if hidden:
                 catalogs = [
                     c for c in catalogs
-                    if str(c.get("id", "")).startswith("franchise_")
-                    or (c.get("id") not in hidden and f"{c.get('id')}::{c.get('type')}" not in hidden)
+                    if c.get("id") not in hidden and f"{c.get('id')}::{c.get('type')}" not in hidden
                 ]
         except Exception:
             pass
@@ -783,11 +702,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
     }
 
 
-async def build_nuvio_collection_data(
-    token: str,
-    collection_type: str = "full",
-    token_data: dict | None = None,
-) -> list:
+async def build_nuvio_collection_data(token: str, collection_type: str = "full") -> list:
     addon_id = f"telegram.media.{token[:8]}"
     
     # Map catalog names to catalog IDs for this token
@@ -1510,98 +1425,27 @@ async def build_nuvio_collection_data(
         "focusGlowEnabled": True
     }
 
-    #----- DB-only mode: Nuvio collection sources must point back to this Telegram addon.
-    #----- Trakt/TMDb sources are independent catalogs and can display titles that do not
-    #----- exist in this server's Telegram media database.
-    def _is_telegram_db_source(source: dict) -> bool:
-        return (
-            source.get("addonId") == addon_id
-            and bool(source.get("catalogId"))
-            and source.get("provider", "addon") == "addon"
-        )
-
-    def _keep_telegram_db_sources(collection: dict) -> None:
-        kept_folders = []
-        for folder in collection.get("folders", []):
-            folder["sources"] = [
-                source for source in (folder.get("sources") or [])
-                if _is_telegram_db_source(source)
-            ]
-            folder["catalogSources"] = [
-                source for source in (folder.get("catalogSources") or [])
-                if _is_telegram_db_source(source)
-            ]
-            # Do not leave an empty folder (or one that would fall back to another provider).
-            if folder["sources"]:
-                kept_folders.append(folder)
-        collection["folders"] = kept_folders
-
-    _keep_telegram_db_sources(ott_collection)
-    _keep_telegram_db_sources(explore_collection)
-
-    #----- Database-driven franchise row. The Ultimate Collection folder is
-    #----- composed from TMDb collection IDs found on playable Telegram movies.
-    #----- A franchise is shown when even one of its titles exists in the DB;
-    #----- each tab's catalog endpoint returns only stored Telegram titles.
-    franchise_collection = None
-    if collection_type != "ott":
-        try:
-            await _ensure_franchise_metadata_index()
-            franchise_groups = await _get_available_franchise_groups(token_data)
-            if franchise_groups:
-                franchise_sources = [
-                    {
-                        "title": group["name"],
-                        "type": "movie",
-                        "addonId": addon_id,
-                        "provider": "addon",
-                        "catalogId": f"franchise_{group['id']}",
-                    }
-                    for group in franchise_groups
-                ]
-                ultimate_folder = {
-                    "id": "folder-dynamic-ultimate-collection",
-                    "title": "Browse Franchises",
-                    "sources": franchise_sources,
-                    "catalogSources": franchise_sources,
-                    "hideTitle": False,
-                    "tileShape": "landscape",
-                    "coverImageUrl": franchise_groups[0].get("poster") or "https://i.ibb.co/5gnMjfPZ/Top-Rated.png",
-                    "focusGifEnabled": False,
-                }
-                franchise_collection = {
-                    "id": "collection-dynamic-franchises-community",
-                    "title": "The Ultimate Collection",
-                    "folders": [ultimate_folder],
-                    "pinToTop": False,
-                    "viewMode": "TABBED_GRID",
-                    "showAllTab": True,
-                    "focusGlowEnabled": True,
-                }
-        except Exception as exc:
-            LOGGER.warning(f"Could not build dynamic franchise collection: {exc}")
-
     if collection_type == "ott":
         return [ott_collection]
     elif collection_type == "explore":
         return [explore_collection]
-    return [ott_collection, explore_collection] + ([franchise_collection] if franchise_collection else [])
+    return [ott_collection, explore_collection]
 
 
 #----- Dynamic Nuvio Collection JSON for this token
 @router.get("/{token}/nuvio-collection.json")
 async def get_nuvio_collection(token: str, token_data: dict = Depends(verify_token)):
-    return await build_nuvio_collection_data(token, "full", token_data)
+    return await build_nuvio_collection_data(token, "full")
 
 
 @router.get("/{token}/nuvio-ott-collection.json")
 async def get_nuvio_ott_collection(token: str, token_data: dict = Depends(verify_token)):
-    return await build_nuvio_collection_data(token, "ott", token_data)
+    return await build_nuvio_collection_data(token, "ott")
 
 
 @router.get("/{token}/nuvio-explore-collection.json")
 async def get_nuvio_explore_collection(token: str, token_data: dict = Depends(verify_token)):
-    return await build_nuvio_collection_data(token, "explore", token_data)
+    return await build_nuvio_collection_data(token, "explore")
 
 
 #----- Catalog listing (latest/popular/custom, with genre/search/skip)
@@ -1634,40 +1478,20 @@ async def get_catalog(token: str, media_type: str, id: str, extra: Optional[str]
     page = (stremio_skip // PAGE_SIZE) + 1
 
     try:
-        if id.startswith("franchise_"):
-            # Franchise tabs are intentionally database-backed. Do not call
-            # TMDb/Trakt for the catalog contents: only movies with a Telegram
-            # record and the matching TMDb collection ID may be returned.
-            if media_type != "movie":
+        if id in {"trending_movies", "trending_series"}:
+            expected_type = "movie" if id == "trending_movies" else "series"
+            if media_type != expected_type:
                 return {"metas": []}
-            try:
-                franchise_id = int(id.removeprefix("franchise_"))
-            except (TypeError, ValueError):
-                return {"metas": []}
-
-            franchise_filter_parts = [
-                {
-                    "tmdb_collection_id": franchise_id,
-                    "telegram.0": {"$exists": True},
-                },
-                _visibility_query(token_data),
-                _not_exclusive_clause(),
-            ]
-            if search_query:
-                search_pattern = {"$regex": re.escape(search_query), "$options": "i"}
-                franchise_filter_parts.append({"$or": [
-                    {"title": search_pattern},
-                    {"title_english": search_pattern},
-                    {"original_title": search_pattern},
-                ]})
-            franchise_filter = _merge_filters(*franchise_filter_parts)
-            data = await db.sort_movies(
-                [("release_year", "asc")],
-                page,
-                PAGE_SIZE,
-                extra_filter=franchise_filter,
+            # TMDB controls rank; MongoDB controls availability and access.
+            # Never fall back to Latest/Popular, because that would falsely label DB rows as trending.
+            trending_ids = await _get_tmdb_trending_ids(
+                "movie" if media_type == "movie" else "tv", "day"
             )
-            items = data.get("movies", [])
+            db_matches = await _get_db_matches_in_tmdb_order(
+                media_type, trending_ids, token_data, genre_filter=genre_filter
+            )
+            start = max(stremio_skip, 0)
+            items = db_matches[start:start + PAGE_SIZE]
         elif id.startswith("custom_") or id.startswith("auto_"):
             catalog_id = id.removeprefix("custom_")
             catalog = await db.get_custom_catalog(catalog_id)
@@ -2322,6 +2146,8 @@ async def configure_addon(token: str, request: Request):
 #----- Catalogs this token can see, in effective (token or global) order
 async def _addon_catalogs_for_token(token_data: dict) -> list:
     entries = [
+        {"id": "trending_movies", "name": "TMDB Trending Movies", "type": "movie"},
+        {"id": "trending_series", "name": "TMDB Trending Series", "type": "series"},
         {"id": "latest_movies", "name": "Latest Movies", "type": "movie"},
         {"id": "top_movies", "name": "Popular Movies", "type": "movie"},
         {"id": "latest_series", "name": "Latest Series", "type": "series"},
