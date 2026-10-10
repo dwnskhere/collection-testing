@@ -1,6 +1,7 @@
 import asyncio
 import re
 import time
+from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import quote, unquote
@@ -178,11 +179,393 @@ async def _get_db_matches_in_tmdb_order(
                     token_data,
                 ):
                     continue
+                if not _has_playable_media(item, collection_name):
+                    continue
                 by_tmdb_id[tmdb_id] = item
         except Exception as exc:
             LOGGER.warning(f"Could not read {collection_name} records from {db_key} for TMDB Trending: {exc}")
 
     return [by_tmdb_id[tmdb_id] for tmdb_id in tmdb_ids if tmdb_id in by_tmdb_id]
+
+# DB-only grouping used by Explore & Discover and The Ultimate Collection.
+# Existing records are enriched in the background; new records receive the same
+# grouping fields while metadata is ingested.
+_GROUPING_BACKFILL_LOCK = asyncio.Lock()
+_GROUPING_BACKFILL_TASK: asyncio.Task | None = None
+_GROUPING_INITIAL_BATCH_DONE = False
+_GROUPING_INITIAL_BATCH_SIZE = 24
+_GROUPING_BACKFILL_CONCURRENCY = 8
+_GROUPING_LIBRARY_CACHE: dict[str, tuple[float, list[dict]]] = {}
+_GROUPING_LIBRARY_CACHE_TTL = 45
+
+_EXPLORE_CATEGORY_DEFINITIONS = [
+    ("india", "India 🇮🇳", "https://img.ge/i/Z9JCe74.jpg"),
+    ("top_rated", "Top Rated", "https://files.catbox.moe/z9m4sa.gif"),
+    ("aliens", "It's Aliens", "https://files.catbox.moe/ag9dpd.jpg"),
+    ("mcu", "Marvel Cinematic Universe", "https://files.catbox.moe/1a751v.jpg"),
+    ("dc", "DC Cinematic Universe", "https://files.catbox.moe/ir2oo4.jpg"),
+    ("star_wars", "Star Wars Universe", "https://i.postimg.cc/vHK1D7bP/Star-Wars.jpg"),
+    ("disney", "Walt Disney Pictures", "https://files.catbox.moe/ilxmp5.jpg"),
+    ("pixar", "Pixar Studio", "https://i.postimg.cc/5yrL2sh2/5440db5f-be91-4941-b1ba-4b4ea07b0f25.jpg"),
+    ("dreamworks", "DreamWorks Studio", "https://i.postimg.cc/JnVNH8M5/882cf7a8-9aa6-4673-81c1-d3ed7a859e95.jpg"),
+    ("warner", "Warner Bros. Pictures", "https://files.catbox.moe/ngl1qa.jpg"),
+    ("anime", "Anime", "https://i.postimg.cc/nLSgj8fw/Anime-Logo-PNG-HD-Image(1).png"),
+]
+
+
+def _storage_database_keys() -> list[str]:
+    keys = [key for key in db.dbs.keys() if str(key).startswith("storage_")]
+    return sorted(keys, key=lambda key: int(str(key).split("_", 1)[1]), reverse=True)
+
+
+def _obj_value(obj, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _entity_metadata(items) -> tuple[list[int], list[str]]:
+    ids: list[int] = []
+    names: list[str] = []
+    for item in items or []:
+        raw_id = _obj_value(item, "id")
+        name = _obj_value(item, "name")
+        try:
+            number = int(raw_id)
+            if number > 0 and number not in ids:
+                ids.append(number)
+        except (TypeError, ValueError):
+            pass
+        if name:
+            normalized = str(name).strip()
+            if normalized and normalized not in names:
+                names.append(normalized)
+    return ids, names
+
+
+def _keyword_names(payload, media_type: str) -> list[str]:
+    if isinstance(payload, dict):
+        payload = payload.get("keywords") or payload.get("results") or []
+    elif not isinstance(payload, list):
+        payload = []
+    names = []
+    for keyword in payload:
+        name = _obj_value(keyword, "name")
+        if name:
+            clean = str(name).strip()
+            if clean and clean not in names:
+                names.append(clean)
+    return names
+
+
+def _normalize_match_text(value) -> str:
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _metadata_title_matches(doc: dict, tmdb_details: dict) -> bool:
+    db_titles = [doc.get("title"), doc.get("title_english"), doc.get("original_title")]
+    tmdb_titles = [tmdb_details.get("title"), tmdb_details.get("original_title"), tmdb_details.get("name"), tmdb_details.get("original_name")]
+    db_names = [_normalize_match_text(value) for value in db_titles if value]
+    tmdb_names = [_normalize_match_text(value) for value in tmdb_titles if value]
+    if not db_names or not tmdb_names:
+        title_matches = True
+    elif any(left == right for left in db_names for right in tmdb_names):
+        title_matches = True
+    else:
+        title_matches = max(SequenceMatcher(None, left, right).ratio() for left in db_names for right in tmdb_names) >= 0.72
+    if not title_matches:
+        return False
+
+    # Numeric fallback TMDB IDs can be wrong. A year mismatch should not attach
+    # an unrelated production company or franchise to a Telegram title.
+    db_year_raw = doc.get("release_year")
+    tmdb_date = tmdb_details.get("release_date") or tmdb_details.get("first_air_date")
+    try:
+        db_year = int(db_year_raw) if db_year_raw else None
+    except (TypeError, ValueError):
+        db_year = None
+    try:
+        tmdb_year = int(str(tmdb_date)[:4]) if tmdb_date else None
+    except (TypeError, ValueError):
+        tmdb_year = None
+    if db_year and tmdb_year and abs(db_year - tmdb_year) > 1:
+        return False
+    return True
+
+
+async def _backfill_grouping_metadata(max_items: int | None = None) -> int:
+    """Fill TMDB franchise/company/network/keyword fields on older Telegram records."""
+    api_key = _tmdb_api_key()
+    if not api_key:
+        return 0
+
+    processed = 0
+    batch: list[tuple[object, str, dict]] = []
+    semaphore = asyncio.Semaphore(_GROUPING_BACKFILL_CONCURRENCY)
+    timeout = httpx.Timeout(10.0, connect=4.0)
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async def enrich_one(collection, media_type: str, doc: dict) -> bool:
+            async with semaphore:
+                try:
+                    response = await client.get(
+                        f"https://api.themoviedb.org/3/{media_type}/{int(doc['tmdb_id'])}",
+                        params={"api_key": api_key, "language": "en-US", "append_to_response": "keywords"},
+                    )
+                    if response.status_code != 200:
+                        return False
+                    details = response.json()
+                    if not _metadata_title_matches(doc, details):
+                        # Don't attach a mismatched numeric ID to a franchise/company.
+                        fields = {"tmdb_grouping_checked": True, "tmdb_grouping_checked_at": datetime.utcnow()}
+                        await collection.update_one({"_id": doc["_id"]}, {"$set": fields})
+                        return True
+                    belongs = details.get("belongs_to_collection") or {}
+                    company_ids, company_names = _entity_metadata(details.get("production_companies") or [])
+                    network_ids, network_names = _entity_metadata(details.get("networks") or [])
+                    keyword_payload = details.get("keywords") or {}
+                    keyword_list = _keyword_names(keyword_payload, media_type)
+                    fields = {
+                        "tmdb_collection_id": belongs.get("id") if media_type == "movie" else None,
+                        "tmdb_collection_name": belongs.get("name") if media_type == "movie" else None,
+                        "tmdb_collection_poster": f"https://image.tmdb.org/t/p/w500{belongs.get('poster_path')}" if media_type == "movie" and belongs.get("poster_path") else "",
+                        "tmdb_collection_backdrop": f"https://image.tmdb.org/t/p/original{belongs.get('backdrop_path')}" if media_type == "movie" and belongs.get("backdrop_path") else "",
+                        "tmdb_company_ids": company_ids,
+                        "tmdb_company_names": company_names,
+                        "tmdb_network_ids": network_ids,
+                        "tmdb_network_names": network_names,
+                        "tmdb_keywords": keyword_list,
+                        "tmdb_grouping_checked": True,
+                        "tmdb_grouping_checked_at": datetime.utcnow(),
+                    }
+                    await collection.update_one({"_id": doc["_id"]}, {"$set": fields})
+                    return True
+                except Exception as exc:
+                    LOGGER.debug(f"TMDB grouping backfill failed for {doc.get('tmdb_id')}: {type(exc).__name__}")
+                    return False
+
+        async def flush() -> tuple[int, int]:
+            if not batch:
+                return 0, 0
+            current = list(batch)
+            batch.clear()
+            results = await asyncio.gather(*(enrich_one(collection, kind, item) for collection, kind, item in current))
+            return len(current), sum(1 for ok in results if ok)
+
+        for db_key in _storage_database_keys():
+            for media_type, collection_name in (("movie", "movie"), ("tv", "tv")):
+                collection = db.dbs[db_key][collection_name]
+                cursor = collection.find(
+                    {
+                        "tmdb_id": {"$exists": True, "$ne": None},
+                        "tmdb_grouping_checked": {"$ne": True},
+                    },
+                    {"_id": 1, "tmdb_id": 1, "title": 1, "title_english": 1, "original_title": 1, "release_year": 1},
+                ).sort("updated_on", -1)
+                async for doc in cursor:
+                    batch.append((collection, media_type, doc))
+                    if len(batch) >= _GROUPING_BACKFILL_CONCURRENCY:
+                        attempted, succeeded = await flush()
+                        processed += succeeded
+                        if max_items is not None:
+                            max_items -= attempted
+                            if max_items <= 0:
+                                return processed
+                if batch:
+                    attempted, succeeded = await flush()
+                    processed += succeeded
+                    if max_items is not None:
+                        max_items -= attempted
+                        if max_items <= 0:
+                            return processed
+    return processed
+
+
+async def _run_grouping_backfill_background() -> None:
+    try:
+        count = await _backfill_grouping_metadata()
+        if count:
+            LOGGER.info(f"Indexed TMDB grouping metadata for {count} Telegram media records")
+        _GROUPING_LIBRARY_CACHE.clear()
+    except Exception as exc:
+        LOGGER.warning(f"Background TMDB grouping indexing failed: {type(exc).__name__}")
+
+
+async def _ensure_grouping_metadata_index() -> None:
+    global _GROUPING_BACKFILL_TASK, _GROUPING_INITIAL_BATCH_DONE
+    if not _tmdb_api_key():
+        return
+    async with _GROUPING_BACKFILL_LOCK:
+        if not _GROUPING_INITIAL_BATCH_DONE:
+            await _backfill_grouping_metadata(_GROUPING_INITIAL_BATCH_SIZE)
+            _GROUPING_INITIAL_BATCH_DONE = True
+        if _GROUPING_BACKFILL_TASK is None or _GROUPING_BACKFILL_TASK.done():
+            _GROUPING_BACKFILL_TASK = asyncio.create_task(_run_grouping_backfill_background())
+
+
+def _has_playable_media(doc: dict, media_type: str) -> bool:
+    if media_type == "movie":
+        return bool(doc.get("telegram"))
+    for season in doc.get("seasons") or []:
+        for episode in season.get("episodes") or []:
+            if episode.get("telegram"):
+                return True
+    return False
+
+
+async def _load_accessible_library(token_data: dict, force_refresh: bool = False) -> list[dict]:
+    token_key = str(token_data.get("token") or token_data.get("user_id") or "anonymous")
+    cached = _GROUPING_LIBRARY_CACHE.get(token_key)
+    now = time.monotonic()
+    if not force_refresh and cached and now - cached[0] < _GROUPING_LIBRARY_CACHE_TTL:
+        return list(cached[1])
+
+    library: list[dict] = []
+    seen: set[tuple[str, int]] = set()
+    query = _merge_filters(
+        {"tmdb_id": {"$exists": True, "$ne": None}},
+        _visibility_query(token_data),
+        _not_exclusive_clause(),
+    )
+    projection = {
+        "tmdb_id": 1, "imdb_id": 1, "title": 1, "title_english": 1, "original_title": 1,
+        "rating": 1, "release_year": 1, "genres": 1, "poster": 1, "backdrop": 1,
+        "is_anime": 1, "original_language": 1, "origin_country": 1, "production_countries": 1,
+        "auto_tags": 1, "tmdb_collection_id": 1, "tmdb_collection_name": 1,
+        "tmdb_collection_poster": 1, "tmdb_collection_backdrop": 1,
+        "tmdb_company_ids": 1, "tmdb_company_names": 1, "tmdb_network_ids": 1,
+        "tmdb_network_names": 1, "tmdb_keywords": 1,
+        "visibility": 1, "allowed_tokens": 1, "telegram": 1, "seasons": 1,
+    }
+    for db_key in _storage_database_keys():
+        for media_type in ("movie", "tv"):
+            try:
+                cursor = db.dbs[db_key][media_type].find(query, projection)
+                async for doc in cursor:
+                    doc_media_type = "series" if media_type == "tv" else "movie"
+                    try:
+                        tmdb_id = int(doc.get("tmdb_id"))
+                    except (TypeError, ValueError):
+                        continue
+                    identity = (doc_media_type, tmdb_id)
+                    if identity in seen:
+                        continue
+                    if not _token_can_view(doc.get("visibility") or "public", doc.get("allowed_tokens") or [], token_data):
+                        continue
+                    if not _has_playable_media(doc, media_type):
+                        continue
+                    seen.add(identity)
+                    doc["media_type"] = media_type
+                    library.append(doc)
+            except Exception as exc:
+                LOGGER.warning(f"Could not read {media_type} grouping records from {db_key}: {type(exc).__name__}")
+    _GROUPING_LIBRARY_CACHE[token_key] = (time.monotonic(), library)
+    return list(library)
+
+
+def _doc_text(doc: dict) -> str:
+    values = [
+        doc.get("title"), doc.get("title_english"), doc.get("original_title"),
+        doc.get("description"), doc.get("tmdb_collection_name"),
+        *(doc.get("tmdb_company_names") or []), *(doc.get("tmdb_network_names") or []),
+        *(doc.get("tmdb_keywords") or []), *(doc.get("auto_tags") or []), *(doc.get("genres") or []),
+    ]
+    return _normalize_match_text(" ".join(str(v) for v in values if v))
+
+
+def _matches_explore_category(doc: dict, key: str) -> bool:
+    text = _doc_text(doc)
+    companies = " ".join(str(v).casefold() for v in (doc.get("tmdb_company_names") or []))
+    networks = " ".join(str(v).casefold() for v in (doc.get("tmdb_network_names") or []))
+    keywords = " ".join(str(v).casefold() for v in (doc.get("tmdb_keywords") or []))
+    collection_name = str(doc.get("tmdb_collection_name") or "").casefold()
+    try:
+        rating = float(doc.get("rating") or 0)
+    except (TypeError, ValueError):
+        rating = 0.0
+    if key == "top_rated":
+        return rating >= 7.5
+    if key == "india":
+        countries = set(doc.get("origin_country") or []) | set(doc.get("production_countries") or [])
+        language = str(doc.get("original_language") or "").casefold()
+        return "IN" in countries or language in {"hi", "bn", "ta", "te", "ml", "kn", "mr", "gu", "pa"}
+    if key == "anime":
+        genres = {str(g).casefold() for g in (doc.get("genres") or [])}
+        language = str(doc.get("original_language") or "").casefold()
+        tags = {str(t).casefold() for t in (doc.get("auto_tags") or [])}
+        return bool(doc.get("is_anime")) or "anime" in tags or "animation" in genres and language == "ja" or "anime" in keywords
+    if key == "aliens":
+        return any(term in f" {text} " for term in (" alien ", " aliens ", " predator ", " xenomorph ")) or "alien" in collection_name or "predator" in collection_name
+    if key == "mcu":
+        company_ids = {int(v) for v in (doc.get("tmdb_company_ids") or []) if str(v).isdigit()}
+        return bool({420, 13252} & company_ids) or "marvel studios" in companies or "marvel cinematic universe" in keywords or "marvel cinematic universe" in text
+    if key == "dc":
+        return any(term in f" {text} " for term in (" dc comics ", " dc films ", " dc studios ", " dc extended universe ", " justice league ", " dc universe ")) or any(term in companies for term in ("dc entertainment", "dc films", "dc studios", "dc comics"))
+    if key == "star_wars":
+        return "star wars" in text or "lucasfilm" in companies or "lucasfilm" in networks
+    if key == "disney":
+        company_ids = {int(v) for v in (doc.get("tmdb_company_ids") or []) if str(v).isdigit()}
+        return 2 in company_ids or "walt disney pictures" in companies
+    if key == "pixar":
+        return "pixar" in companies or "pixar" in text
+    if key == "dreamworks":
+        return "dreamworks" in companies or "dreamworks" in text
+    if key == "warner":
+        return "warner bros" in companies or "warner brothers" in companies
+    return False
+
+
+async def _get_dynamic_franchise_groups(token_data: dict) -> list[dict]:
+    await _ensure_grouping_metadata_index()
+    library = await _load_accessible_library(token_data)
+    groups: dict[int, dict] = {}
+    for item in library:
+        if item.get("media_type") != "movie":
+            continue
+        try:
+            collection_id = int(item.get("tmdb_collection_id"))
+        except (TypeError, ValueError):
+            continue
+        name = str(item.get("tmdb_collection_name") or "").strip()
+        if not name:
+            continue
+        group = groups.setdefault(collection_id, {
+            "id": collection_id, "name": name,
+            "poster": item.get("tmdb_collection_poster") or item.get("poster") or "",
+            "backdrop": item.get("tmdb_collection_backdrop") or item.get("backdrop") or "",
+            "count": 0,
+        })
+        group["count"] += 1
+        if not group.get("poster"):
+            group["poster"] = item.get("poster") or ""
+        if not group.get("backdrop"):
+            group["backdrop"] = item.get("backdrop") or ""
+    return sorted(groups.values(), key=lambda item: (-item["count"], item["name"].casefold()))
+
+
+async def _get_dynamic_explore_catalogs(token_data: dict) -> dict[str, set[str]]:
+    """Return categories and media types that actually have playable Telegram records."""
+    await _ensure_grouping_metadata_index()
+    library = await _load_accessible_library(token_data)
+    found: dict[str, set[str]] = {}
+    for key, _title, _cover in _EXPLORE_CATEGORY_DEFINITIONS:
+        matching_types = {
+            str(item.get("media_type"))
+            for item in library
+            if item.get("media_type") in {"movie", "tv"}
+            and _matches_explore_category(item, key)
+        }
+        if matching_types:
+            found[key] = matching_types
+    return found
+
+
+def _addon_catalog_source(addon_id: str, catalog_id: str, media_type: str, title: str | None = None) -> dict:
+    source = {"type": media_type, "addonId": addon_id, "provider": "addon", "catalogId": catalog_id}
+    if title:
+        source["title"] = title
+    return source
+
 
 def _donation():
     text = "Enjoying Telegram Stremio?\nTap to support the developer"
@@ -538,25 +921,30 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
                 "type": "movie",
                 "id": "trending_movies",
                 "name": "TMDB Trending",
+                "showInHome": False,
                 "extra": [
+                    {"name": "search", "isRequired": True},
                     {"name": "genre", "isRequired": False, "options": GENRES},
                     {"name": "skip"}
                 ],
-                "extraSupported": ["genre", "skip"]
+                "extraSupported": ["search", "genre", "skip"]
             },
             {
                 "type": "series",
                 "id": "trending_series",
                 "name": "TMDB Trending",
+                "showInHome": False,
                 "extra": [
+                    {"name": "search", "isRequired": True},
                     {"name": "genre", "isRequired": False, "options": GENRES},
                     {"name": "skip"}
                 ],
-                "extraSupported": ["genre", "skip"]
+                "extraSupported": ["search", "genre", "skip"]
             },
             {
                 "type": "movie",
                 "id": "latest_movies",
+                "showInHome": False,
                 "name": "Latest",
                 "extra": [
                     {"name": "genre", "isRequired": False, "options": GENRES},
@@ -567,6 +955,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
             {
                 "type": "movie",
                 "id": "top_movies",
+                "showInHome": False,
                 "name": "Popular",
                 "extra": [
                     {"name": "genre", "isRequired": False, "options": GENRES},
@@ -578,6 +967,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
             {
                 "type": "series",
                 "id": "latest_series",
+                "showInHome": False,
                 "name": "Latest",
                 "extra": [
                     {"name": "genre", "isRequired": False, "options": GENRES},
@@ -588,6 +978,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
             {
                 "type": "series",
                 "id": "top_series",
+                "showInHome": False,
                 "name": "Popular",
                 "extra": [
                     {"name": "genre", "isRequired": False, "options": GENRES},
@@ -615,6 +1006,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
                     catalogs.append({
                         "type": "movie",
                         "id": f"custom_{catalog_id}",
+                        "showInHome": False,
                         "name": catalog_name,
                         "extra": [{"name": "search", "isRequired": False}, {"name": "skip"}],
                         "extraSupported": ["search", "skip"],
@@ -623,12 +1015,36 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
                     catalogs.append({
                         "type": "series",
                         "id": f"custom_{catalog_id}",
+                        "showInHome": False,
                         "name": catalog_name,
                         "extra": [{"name": "search", "isRequired": False}, {"name": "skip"}],
                         "extraSupported": ["search", "skip"],
                     })
         except Exception:
             pass
+
+        try:
+            for key, title, _cover in _EXPLORE_CATEGORY_DEFINITIONS:
+                for stremio_media_type in ("movie", "series"):
+                    catalogs.append({
+                        "type": stremio_media_type,
+                        "id": f"explore_{key}",
+                        "name": title,
+                        "showInHome": False,
+                        "extra": [{"name": "search", "isRequired": True}, {"name": "skip"}],
+                        "extraSupported": ["search", "skip"],
+                    })
+            for franchise in await _get_dynamic_franchise_groups(token_data):
+                catalogs.append({
+                    "type": "movie",
+                    "id": f"franchise_{franchise['id']}",
+                    "name": franchise["name"],
+                    "showInHome": False,
+                    "extra": [{"name": "search", "isRequired": True}, {"name": "skip"}],
+                    "extraSupported": ["search", "skip"],
+                })
+        except Exception as exc:
+            LOGGER.warning(f"Could not add database-only Explore catalogs to manifest: {type(exc).__name__}")
 
         try:
             order = await db.get_catalog_order()
@@ -646,7 +1062,8 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
             if hidden:
                 catalogs = [
                     c for c in catalogs
-                    if c.get("id") not in hidden and f"{c.get('id')}::{c.get('type')}" not in hidden
+                    if c.get("showInHome") is False
+                    or (c.get("id") not in hidden and f"{c.get('id')}::{c.get('type')}" not in hidden)
                 ]
         except Exception:
             pass
@@ -654,7 +1071,9 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
 
     addon_name = ADDON_NAME
     addon_desc = "Streams movies and series from your Telegram."
-    addon_version = ADDON_VERSION
+    # Nuvio clients cache manifest catalog descriptors against the version string.
+    # Bump this stable layout revision whenever showInHome/catalog grouping changes.
+    addon_version = f"{ADDON_VERSION}-dbonly-catalog-layout-4"
 
     #----- Show expiry info in the addon: token's own expiry first, else the subscription
     try:
@@ -673,7 +1092,7 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
                 f"Streams movies and series from your Telegram."
             )
             epoch_tag = format(int(expiry_obj.timestamp()) & 0xFFFF, "x")
-            addon_version = f"{ADDON_VERSION}-{epoch_tag}"
+            addon_version = f"{ADDON_VERSION}-dbonly-catalog-layout-4-{epoch_tag}"
     except Exception:
         pass
 
@@ -702,9 +1121,10 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
     }
 
 
-async def build_nuvio_collection_data(token: str, collection_type: str = "full") -> list:
+async def build_nuvio_collection_data(token: str, collection_type: str = "full", token_data: dict | None = None) -> list:
     addon_id = f"telegram.media.{token[:8]}"
-    
+    token_data = token_data or {"token": token}
+
     # Map catalog names to catalog IDs for this token
     catalog_map = {}
     auto_key_map = {}
@@ -968,6 +1388,25 @@ async def build_nuvio_collection_data(token: str, collection_type: str = "full")
         "focusGlowEnabled": True
     }
 
+    # Trending Now is one folder with six tabs. Trending catalogs are declared
+    # with a required search field in the manifest: Nuvio's home-row builder
+    # excludes catalogs with any required extra, while the collection resolver
+    # can still resolve these IDs and the backend returns the default list when
+    # the optional-at-runtime search path is omitted.
+    trending_sources = [
+        _addon_catalog_source(addon_id, "trending_movies", "movie", "TMDB Trending Movies"),
+        _addon_catalog_source(addon_id, "trending_series", "series", "TMDB Trending Series"),
+        _addon_catalog_source(addon_id, "latest_movies", "movie", "Latest (Movies)"),
+        _addon_catalog_source(addon_id, "latest_series", "series", "Latest (Series)"),
+        _addon_catalog_source(addon_id, "top_movies", "movie", "Popular (Movies)"),
+        _addon_catalog_source(addon_id, "top_series", "series", "Popular (Series)"),
+    ]
+    for _folder in ott_collection.get("folders", []):
+        if _folder.get("id") == "68ba6673-3480-4601-980e-4f69862777c3":
+            _folder["sources"] = trending_sources
+            _folder["catalogSources"] = trending_sources
+            break
+
     # Auto-hide OTT folders whose catalogs are not enabled/synced in database
     cleaned_folders = []
     for f in ott_collection.get("folders") or []:
@@ -980,472 +1419,133 @@ async def build_nuvio_collection_data(token: str, collection_type: str = "full")
             cleaned_folders.append(folder_copy)
     ott_collection["folders"] = cleaned_folders
 
+    # Explore is built from the titles actually present in this token's Telegram
+    # database. No TMDB/Trakt source is called directly by Nuvio, so unavailable
+    # titles cannot leak into the collection. Metadata only determines grouping.
     explore_collection = {
         "id": "966190a9-3785-4ef0-9f1b-883478bf618c-community",
         "title": "Explore & Discover🗺️",
-        "folders": [
-          {
-            "id": "f2e9b8dc-f50a-4bc7-96d3-30053ce27ad6",
-            "title": "India 🇮🇳",
-            "sources": [
-              {"type": "movie", "addonId": addon_id, "provider": "addon", "catalogId": bollywood_movie},
-              {"type": "series", "addonId": addon_id, "provider": "addon", "catalogId": bollywood_series}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://media2.giphy.com/media/v1.Y2lkPTZjMDliOTUycDFtbGliOHdobmttbjRvZzZuODVjMnk4NHk2eHl0cW8zZG43a2M4cSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/zySGXB0I0me7fGQv3Y/giphy.gif",
-            "coverImageUrl": "https://img.ge/i/Z9JCe74.jpg",
-            "catalogSources": [
-              {"type": "movie", "addonId": addon_id, "catalogId": bollywood_movie},
-              {"type": "series", "addonId": addon_id, "catalogId": bollywood_series}
-            ],
-            "focusGifEnabled": True
-          },
-          {
-            "id": "c2206436-c704-4fca-a026-f4d426c40992",
-            "title": "Warner Bros. Pictures",
-            "sources": [
-              {"title": "Warner Bros.", "sortBy": "popularity.desc", "tmdbId": 174, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "COMPANY"}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExYmpsd2tvcmR1ZzZpZ2cxYWRqcmhycWRqeXBlMWttNGNhZjZkaGp4ZSZlcD12MV9naWZzX3NlYXJjaCZjdD1n/WUaJwN6Rlsf9M47p8e/giphy.gif",
-            "coverImageUrl": "https://files.catbox.moe/ngl1qa.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": True
-          },
-          {
-            "id": "folder-08ic2wbn",
-            "title": "Anime",
-            "sources": [
-              {
-                "id": "src-60QLR3CH",
-                "name": "Trending Anime Series",
-                "genre": "Trending Anime Series",
-                "title": "Trending Anime Series",
-                "sortBy": "popularity.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 60,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "TV",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-3OBFNGID",
-                "name": "Top Rated Anime Series",
-                "genre": "Top Rated Anime Series",
-                "title": "Top Rated Anime Series",
-                "sortBy": "vote_average.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 400,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "TV",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-28C4UZ10",
-                "name": "Trending Anime Films",
-                "genre": "Trending Anime Films",
-                "title": "Trending Anime Films",
-                "sortBy": "popularity.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 120,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "MOVIE",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-BK4KJJNV",
-                "name": "Top Rated Anime Films",
-                "genre": "Top Rated Anime Films",
-                "title": "Top Rated Anime Films",
-                "sortBy": "vote_average.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 400,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "MOVIE",
-                "tmdbSourceType": "DISCOVER"
-              }
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://i.postimg.cc/KYhBq15R/VID-20260417-220322.gif",
-            "titleLogoUrl": "https://raw.githubusercontent.com/ImKaptain/nuvio-art/main/art/anime/discover-anime/discover-anime-logo.png",
-            "coverImageUrl": "https://i.postimg.cc/nLSgj8fw/Anime-Logo-PNG-HD-Image(1).png",
-            "catalogSources": [],
-            "focusGifEnabled": True,
-            "heroBackdropUrl": "https://raw.githubusercontent.com/ImKaptain/nuvio-art/main/art/anime/discover-anime/discover-anime-backdrop.jpg"
-          }
-        ],
+        "folders": [],
         "pinToTop": True,
         "viewMode": "TABBED_GRID",
         "showAllTab": True,
-        "focusGlowEnabled": True
+        "focusGlowEnabled": True,
     }
 
-    explore_collection = {
-        "id": "966190a9-3785-4ef0-9f1b-883478bf618c-community",
-        "title": "Explore & Discover🗺️",
-        "folders": [
-          {
-            "id": "f2e9b8dc-f50a-4bc7-96d3-30053ce27ad6",
-            "title": "India 🇮🇳",
-            "sources": [
-              {"type": "movie", "addonId": addon_id, "provider": "addon", "catalogId": bollywood_movie},
-              {"type": "series", "addonId": addon_id, "provider": "addon", "catalogId": bollywood_series}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://media2.giphy.com/media/v1.Y2lkPTZjMDliOTUycDFtbGliOHdobmttbjRvZzZuODVjMnk4NHk2eHl0cW8zZG43a2M4cSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/zySGXB0I0me7fGQv3Y/giphy.gif",
-            "coverImageUrl": "https://img.ge/i/Z9JCe74.jpg",
-            "catalogSources": [
-              {"type": "movie", "addonId": addon_id, "catalogId": bollywood_movie},
-              {"type": "series", "addonId": addon_id, "catalogId": bollywood_series}
-            ],
-            "focusGifEnabled": True
-          },
-          {
-            "id": "5069a848-f76f-4c68-ba6b-142d86a24603",
-            "title": "The Ultimate Collection",
-            "sources": [
-              {"title": "The Fast and the Furious", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 75},
-              {"title": "Harry Potter", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 84},
-              {"title": "Top Gun", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 5022174},
-              {"title": "The James Bond (007)", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 1919354},
-              {"title": "Jason Bourne", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 36572888},
-              {"title": "Jurassic Park/World", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 29684902},
-              {"title": "Mission: Impossible", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 131},
-              {"title": "Indiana Jones", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 15},
-              {"title": "Pirates of the Caribbean", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 10},
-              {"title": "Middle-Earth", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 1642688},
-              {"title": "Avatar", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 884},
-              {"title": "John Wick", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 2435487},
-              {"title": "Transformer", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 176},
-              {"title": "The Matrix", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 81},
-              {"title": "Planet of the Apes", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 11214053},
-              {"title": "The MonsterVerse", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 25439284},
-              {"title": "The Conjuring", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 3877179},
-              {"title": "The Godfather", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 38},
-              {"title": "The Rocky", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 11723321},
-              {"title": "Alien & Predator", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 34030187},
-              {"title": "Evil Dead", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 35297070},
-              {"title": "The Terminator", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 36},
-              {"title": "Die Hard", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 68},
-              {"title": "Ip Man", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 11338691},
-              {"title": "National Treasure", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 190},
-              {"title": "Jaws", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 73},
-              {"title": "Rambo", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 151},
-              {"title": "Men in Black", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 10870886},
-              {"title": "The Exorcist", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 416},
-              {"title": "28 Days Later", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 36431272},
-              {"title": "Bad Boys", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 11364118},
-              {"title": "Ocean's", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 2702670},
-              {"title": "The Hangover", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 854},
-              {"title": "Home Alone", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 20735298},
-              {"title": "Rush Hour", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 197}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://media1.tenor.com/m/sSEUDpULM2YAAAAC/pnc-plexnchill.gif",
-            "coverImageUrl": "https://i.ibb.co/5gnMjfPZ/Top-Rated.png",
-            "catalogSources": [],
-            "focusGifEnabled": True
-          },
-          {
-            "id": "74f27ef0-5e73-40e2-a189-63d951dbf792",
-            "title": "Top Rated",
-            "sources": [
-              {"title": "IMDB: Top Rated Movies Movies", "sortBy": "rank", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 2142753},
-              {"title": "IMDB: Top Rated TV Shows Series", "sortBy": "rank", "sortHow": "asc", "provider": "trakt", "mediaType": "TV", "traktListId": 2143363}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://files.catbox.moe/z9m4sa.gif",
-            "coverImageUrl": "https://files.catbox.moe/z9m4sa.gif",
-            "catalogSources": [],
-            "focusGifEnabled": True
-          },
-          {
-            "id": "folder-516b0b3d",
-            "title": "It's Aliens",
-            "sources": [
-              {"title": "It's Aliens", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 33753562}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://media2.giphy.com/media/v1.Y2lkPTZjMDliOTUyYzZhZmVjNW11anR3dngzZTUzOWZya2hyYnd2am9tbnRxbWFtN25hYiZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/bg46B8m5ek7jTzyCWI/giphy.gif",
-            "coverImageUrl": "https://files.catbox.moe/ag9dpd.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": False
-          },
-          {
-            "id": "cd74f767-b492-4a4c-a3a4-7296925e15a3",
-            "title": "Marvel Cinematic Universe",
-            "sources": [
-              {"title": "Marvel Studios Movies", "sortBy": "primary_release_date.desc", "tmdbId": 420, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "COMPANY"},
-              {"title": "Marvel Studios Series", "sortBy": "primary_release_date.desc", "tmdbId": 420, "provider": "tmdb", "mediaType": "TV", "tmdbSourceType": "COMPANY"},
-              {"title": "Marvel Animation Movies", "sortBy": "primary_release_date.desc", "tmdbId": 13252, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "COMPANY"},
-              {"title": "Marvel Animation Series", "sortBy": "primary_release_date.desc", "tmdbId": 13252, "provider": "tmdb", "mediaType": "TV", "tmdbSourceType": "COMPANY"},
-              {"title": "X-Men (film series)", "sortBy": "original", "tmdbId": 27741, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "LIST"},
-              {"title": "Spider Man Movies", "sortBy": "rank", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 36436842}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://giffiles.alphacoders.com/127/12700.gif",
-            "titleLogoUrl": "https://i.postimg.cc/XNHCLgb4/Marvel-Logo.png",
-            "coverImageUrl": "https://files.catbox.moe/1a751v.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": False,
-            "heroBackdropUrl": "https://i.postimg.cc/v8qVhvsn/Marvel-BG.png"
-          },
-          {
-            "id": "4975c018-a714-45d2-8079-49125d6a174b",
-            "title": "DC Cinematic Universe",
-            "sources": [
-              {"title": "DC Extended Universe", "sortBy": "original", "tmdbId": 85568, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "LIST"},
-              {"title": "DC Universe Animated Original Movies", "sortBy": "original", "tmdbId": 3255, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "LIST"},
-              {"title": "Justice League Collection", "sortBy": "original", "tmdbId": 876125, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "COLLECTION"},
-              {"title": "Superman Collection", "sortBy": "original", "tmdbId": 1540907, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "COLLECTION"}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://i.pinimg.com/originals/cd/4e/19/cd4e195405cbaed5a3e5b95708a41105.gif",
-            "titleLogoUrl": "https://i.postimg.cc/3WQ8YQ4b/960px-DC-Comics-logo-svg-png-utm-source-commons-wikimedia.png",
-            "coverImageUrl": "https://files.catbox.moe/ir2oo4.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": True,
-            "heroBackdropUrl": "https://www.nuvioapp.space/uploads/covers/ef215e66-54da-4b03-a946-34727ba52766.jpg"
-          },
-          {
-            "id": "72394705-9eaf-4d7d-8533-6b004f5287fe",
-            "title": "Star Wars Universe",
-            "sources": [
-              {"title": "Star Wars Movies", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 22202556},
-              {"title": "Star Wars: Shows & Series", "sortBy": "released", "sortHow": "asc", "provider": "trakt", "mediaType": "TV", "traktListId": 22757470}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://i.pinimg.com/originals/0c/36/62/0c36620ff24709b0ccf69f97b8ba67ec.gif",
-            "titleLogoUrl": "https://i.postimg.cc/L6r64vPj/Star-Wars-Logo.png",
-            "coverImageUrl": "https://i.postimg.cc/vHK1D7bP/Star-Wars.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": False,
-            "heroBackdropUrl": "https://i.postimg.cc/sDtDfKWJ/Star-Wars-BG.jpg"
-          },
-          {
-            "id": "65388509-423e-40f9-97cf-6a645474e35b",
-            "title": "Walt Disney Pictures",
-            "sources": [
-              {"title": "Walt Disney Pictures", "sortBy": "popularity.desc", "tmdbId": 2, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "COMPANY"}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://i.pinimg.com/originals/b0/0f/67/b00f67537ff541fe3ed204d0a2e9e237.gif",
-            "coverImageUrl": "https://files.catbox.moe/ilxmp5.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": True
-          },
-          {
-            "id": "3b979d6d-2a1b-4cea-b7c7-a83d39ceb2ea",
-            "title": "Pixar Studio",
-            "sources": [
-              {"title": "Pixar Feature Films", "sortBy": "released", "sortHow": "desc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 801240},
-              {"title": "Pixar Short Films", "sortBy": "released", "sortHow": "desc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 2749609}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://i.postimg.cc/fybnBxZ3/Pixar-Gif.gif",
-            "titleLogoUrl": "https://i.postimg.cc/J0Y4Lsdk/Pixar-Logo.png",
-            "coverImageUrl": "https://i.postimg.cc/5yrL2sh2/5440db5f-be91-4941-b1ba-4b4ea07b0f25.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": False,
-            "heroBackdropUrl": "https://i.postimg.cc/hj6yHJJv/Pixar-BG.jpg"
-          },
-          {
-            "id": "5b8452e4-50c1-4097-8848-08057442438e",
-            "title": "Dreamworks Studio",
-            "sources": [
-              {"title": "Dreamworks Feature Films", "sortBy": "released", "sortHow": "desc", "provider": "trakt", "mediaType": "MOVIE", "traktListId": 801242}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://i.postimg.cc/52mcd70J/Dreamworks-Gif.gif",
-            "titleLogoUrl": "https://i.postimg.cc/J4QCZCzG/Dream-Works-Logo.png",
-            "coverImageUrl": "https://i.postimg.cc/JnVNH8M5/882cf7a8-9aa6-4673-81c1-d3ed7a859e95.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": True,
-            "heroBackdropUrl": "https://i.postimg.cc/qqVzFhSX/Dream-Works-BG.jpg"
-          },
-          {
-            "id": "c2206436-c704-4fca-a026-f4d426c40992",
-            "title": "Warner Bros. Pictures",
-            "sources": [
-              {"title": "Warner Bros.", "sortBy": "popularity.desc", "tmdbId": 174, "provider": "tmdb", "mediaType": "MOVIE", "tmdbSourceType": "COMPANY"}
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExYmpsd2tvcmR1ZzZpZ2cxYWRqcmhycWRqeXBlMWttNGNhZjZkaGp4ZSZlcD12MV9naWZzX3NlYXJjaCZjdD1n/WUaJwN6Rlsf9M47p8e/giphy.gif",
-            "coverImageUrl": "https://files.catbox.moe/ngl1qa.jpg",
-            "catalogSources": [],
-            "focusGifEnabled": True
-          },
-          {
-            "id": "folder-08ic2wbn",
-            "title": "Anime",
-            "sources": [
-              {
-                "id": "src-60QLR3CH",
-                "name": "Trending Anime Series",
-                "genre": "Trending Anime Series",
-                "title": "Trending Anime Series",
-                "sortBy": "popularity.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 60,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "TV",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-3OBFNGID",
-                "name": "Top Rated Anime Series",
-                "genre": "Top Rated Anime Series",
-                "title": "Top Rated Anime Series",
-                "sortBy": "vote_average.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 400,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "TV",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-28C4UZ10",
-                "name": "Trending Anime Films",
-                "genre": "Trending Anime Films",
-                "title": "Trending Anime Films",
-                "sortBy": "popularity.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 120,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "MOVIE",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-BK4KJJNV",
-                "name": "Top Rated Anime Films",
-                "genre": "Top Rated Anime Films",
-                "title": "Top Rated Anime Films",
-                "sortBy": "vote_average.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 400,
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "MOVIE",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-ABWAIOIK",
-                "name": "New This Season",
-                "genre": "New This Season",
-                "title": "New This Season",
-                "sortBy": "first_air_date.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 5,
-                  "releaseDateGte": "2025-10-01",
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "TV",
-                "tmdbSourceType": "DISCOVER"
-              },
-              {
-                "id": "src-3OBFNGID",
-                "name": "Modern Classics of the 2010s",
-                "genre": "Modern Classics of the 2010s",
-                "title": "Modern Classics of the 2010s",
-                "sortBy": "vote_average.desc",
-                "filters": {
-                  "withGenres": "16",
-                  "voteCountGte": 200,
-                  "releaseDateGte": "2010-01-01",
-                  "releaseDateLte": "2019-12-31",
-                  "withoutKeywords": "198385|378816|155477|256466|329280|570|1817|15078|13059|195669|325693|360629|284535|356759|337946",
-                  "withOriginalLanguage": "ja"
-                },
-                "provider": "tmdb",
-                "mediaType": "TV",
-                "tmdbSourceType": "DISCOVER"
-              }
-            ],
-            "hideTitle": False,
-            "tileShape": "landscape",
-            "focusGifUrl": "https://i.postimg.cc/KYhBq15R/VID-20260417-220322.gif",
-            "titleLogoUrl": "https://raw.githubusercontent.com/ImKaptain/nuvio-art/main/art/anime/discover-anime/discover-anime-logo.png",
-            "coverImageUrl": "https://i.postimg.cc/nLSgj8fw/Anime-Logo-PNG-HD-Image(1).png",
-            "catalogSources": [],
-            "focusGifEnabled": True,
-            "heroBackdropUrl": "https://raw.githubusercontent.com/ImKaptain/nuvio-art/main/art/anime/discover-anime/discover-anime-backdrop.jpg"
-          }
-        ],
-        "pinToTop": True,
-        "viewMode": "TABBED_GRID",
-        "showAllTab": True,
-        "focusGlowEnabled": True
-    }
+    if collection_type != "ott":
+        try:
+            dynamic_categories = await _get_dynamic_explore_catalogs(token_data)
+            for key, title, cover in _EXPLORE_CATEGORY_DEFINITIONS:
+                media_types = dynamic_categories.get(key) or set()
+                if not media_types:
+                    continue
+                sources = [
+                    _addon_catalog_source(
+                        addon_id,
+                        f"explore_{key}",
+                        "series" if db_media_type == "tv" else "movie",
+                        title,
+                    )
+                    for db_media_type in ("movie", "tv") if db_media_type in media_types
+                ]
+                if not sources:
+                    continue
+                folder_id = {
+                    "india": "f2e9b8dc-f50a-4bc7-96d3-30053ce27ad6",
+                    "top_rated": "74f27ef0-5e73-40e2-a189-63d951dbf792",
+                    "aliens": "folder-516b0b3d",
+                    "mcu": "cd74f767-b492-4a4c-a3a4-7296925e15a3",
+                    "dc": "4975c018-a714-45d2-8079-49125d6a174b",
+                    "star_wars": "72394705-9eaf-4d7d-8533-6b004f5287fe",
+                    "disney": "65388509-423e-40f9-97cf-6a645474e35b",
+                    "pixar": "3b979d6d-2a1b-4cea-b7c7-a83d39ceb2ea",
+                    "dreamworks": "5b8452e4-50c1-4097-8848-08057442438e",
+                    "warner": "c2206436-c704-4fca-a026-f4d426c40992",
+                    "anime": "folder-08ic2wbn",
+                }.get(key, f"folder-explore-{key}")
+                folder = {
+                    "id": folder_id,
+                    "title": title,
+                    "sources": sources,
+                    "catalogSources": sources,
+                    "hideTitle": False,
+                    "tileShape": "landscape",
+                    "coverImageUrl": cover,
+                    "focusGifEnabled": False,
+                }
+                # Keep existing branded art/backdrops for familiar sections.
+                if key == "india":
+                    folder["focusGifUrl"] = "https://media2.giphy.com/media/v1.Y2lkPTZjMDliOTUycDFtbGliOHdobmttbjRvZzZuODVjMnk4NHk2eHl0cW8zZG43a2M4cSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/zySGXB0I0me7fGQv3Y/giphy.gif"
+                elif key == "mcu":
+                    folder.update({"focusGifUrl": "https://giffiles.alphacoders.com/127/12700.gif", "titleLogoUrl": "https://i.postimg.cc/XNHCLgb4/Marvel-Logo.png", "heroBackdropUrl": "https://i.postimg.cc/v8qVhvsn/Marvel-BG.png"})
+                elif key == "dc":
+                    folder.update({"focusGifUrl": "https://i.pinimg.com/originals/cd/4e/19/cd4e195405cbaed5a3e5b95708a41105.gif", "titleLogoUrl": "https://i.postimg.cc/3WQ8YQ4b/960px-DC-Comics-logo-svg-png-utm-source-commons-wikimedia.png"})
+                elif key == "star_wars":
+                    folder.update({"focusGifUrl": "https://i.pinimg.com/originals/0c/36/62/0c36620ff24709b0ccf69f97b8ba67ec.gif", "titleLogoUrl": "https://i.postimg.cc/L6r64vPj/Star-Wars-Logo.png", "heroBackdropUrl": "https://i.postimg.cc/sDtDfKWJ/Star-Wars-BG.jpg"})
+                elif key == "anime":
+                    folder.update({"focusGifUrl": "https://i.postimg.cc/KYhBq15R/VID-20260417-220322.gif", "titleLogoUrl": "https://raw.githubusercontent.com/ImKaptain/nuvio-art/main/art/anime/discover-anime/discover-anime-logo.png", "heroBackdropUrl": "https://raw.githubusercontent.com/ImKaptain/nuvio-art/main/art/anime/discover-anime/discover-anime-backdrop.jpg"})
+                explore_collection["folders"].append(folder)
+        except Exception as exc:
+            LOGGER.warning(f"Could not build database-only Explore collection: {type(exc).__name__}")
+
+    # This is the dynamic franchise browser. The list of franchises is derived
+    # from TMDB collection metadata attached to playable Telegram movies, not a
+    # static list of Trakt/TMDB titles. New franchises appear after this JSON URL
+    # is fetched again; content within each franchise updates from MongoDB.
+    franchise_collection = None
+    if collection_type != "ott":
+        try:
+            franchise_groups = await _get_dynamic_franchise_groups(token_data)
+            if franchise_groups:
+                franchise_sources = [
+                    _addon_catalog_source(addon_id, f"franchise_{group['id']}", "movie", group["name"])
+                    for group in franchise_groups
+                ]
+                franchise_collection = {
+                    "id": "collection-dynamic-franchises-community",
+                    "title": "The Ultimate Collection",
+                    "folders": [{
+                        "id": "folder-dynamic-ultimate-collection",
+                        "title": "Browse Franchises",
+                        "sources": franchise_sources,
+                        "catalogSources": franchise_sources,
+                        "hideTitle": False,
+                        "tileShape": "landscape",
+                        "coverImageUrl": franchise_groups[0].get("poster") or "https://i.ibb.co/5gnMjfPZ/Top-Rated.png",
+                        "focusGifEnabled": False,
+                    }],
+                    "pinToTop": False,
+                    "viewMode": "TABBED_GRID",
+                    "showAllTab": True,
+                    "focusGlowEnabled": True,
+                }
+        except Exception as exc:
+            LOGGER.warning(f"Could not build dynamic franchise collection: {type(exc).__name__}")
 
     if collection_type == "ott":
         return [ott_collection]
     elif collection_type == "explore":
         return [explore_collection]
-    return [ott_collection, explore_collection]
+    result = [ott_collection, explore_collection]
+    if franchise_collection:
+        result.append(franchise_collection)
+    return result
 
 
 #----- Dynamic Nuvio Collection JSON for this token
 @router.get("/{token}/nuvio-collection.json")
 async def get_nuvio_collection(token: str, token_data: dict = Depends(verify_token)):
-    return await build_nuvio_collection_data(token, "full")
+    return await build_nuvio_collection_data(token, "full", token_data)
 
 
 @router.get("/{token}/nuvio-ott-collection.json")
 async def get_nuvio_ott_collection(token: str, token_data: dict = Depends(verify_token)):
-    return await build_nuvio_collection_data(token, "ott")
+    return await build_nuvio_collection_data(token, "ott", token_data)
 
 
 @router.get("/{token}/nuvio-explore-collection.json")
 async def get_nuvio_explore_collection(token: str, token_data: dict = Depends(verify_token)):
-    return await build_nuvio_collection_data(token, "explore")
+    return await build_nuvio_collection_data(token, "explore", token_data)
 
 
 #----- Catalog listing (latest/popular/custom, with genre/search/skip)
@@ -1492,6 +1592,53 @@ async def get_catalog(token: str, media_type: str, id: str, extra: Optional[str]
             )
             start = max(stremio_skip, 0)
             items = db_matches[start:start + PAGE_SIZE]
+        elif id.startswith("franchise_"):
+            if media_type != "movie":
+                return {"metas": []}
+            try:
+                franchise_id = int(id.removeprefix("franchise_"))
+            except (TypeError, ValueError):
+                return {"metas": []}
+            await _ensure_grouping_metadata_index()
+            library = await _load_accessible_library(token_data)
+            items = [
+                item for item in library
+                if item.get("media_type") == "movie"
+                and str(item.get("tmdb_collection_id") or "") == str(franchise_id)
+            ]
+            items.sort(key=lambda item: (item.get("release_year") or 0, (item.get("title") or "").casefold()))
+            if search_query:
+                q = search_query.casefold()
+                items = [item for item in items if q in str(item.get("title") or "").casefold()]
+            if genre_filter:
+                items = [item for item in items if genre_filter in (item.get("genres") or [])]
+            start = max(stremio_skip, 0)
+            items = items[start:start + PAGE_SIZE]
+        elif id.startswith("explore_"):
+            category_key = id.removeprefix("explore_")
+            if category_key not in {key for key, _title, _cover in _EXPLORE_CATEGORY_DEFINITIONS}:
+                return {"metas": []}
+            await _ensure_grouping_metadata_index()
+            library = await _load_accessible_library(token_data)
+            db_media_type = "tv" if media_type == "series" else "movie"
+            items = [
+                item for item in library
+                if item.get("media_type") == db_media_type
+                and _matches_explore_category(item, category_key)
+            ]
+            if search_query:
+                q = search_query.casefold()
+                items = [item for item in items if q in str(item.get("title") or "").casefold()]
+            if genre_filter:
+                items = [item for item in items if genre_filter in (item.get("genres") or [])]
+            if category_key == "top_rated":
+                items.sort(key=lambda item: float(item.get("rating") or 0), reverse=True)
+            elif category_key == "franchise":
+                items.sort(key=lambda item: item.get("release_year") or 0)
+            else:
+                items.sort(key=lambda item: (item.get("release_year") or 0, (item.get("title") or "").casefold()), reverse=True)
+            start = max(stremio_skip, 0)
+            items = items[start:start + PAGE_SIZE]
         elif id.startswith("custom_") or id.startswith("auto_"):
             catalog_id = id.removeprefix("custom_")
             catalog = await db.get_custom_catalog(catalog_id)
@@ -2146,12 +2293,12 @@ async def configure_addon(token: str, request: Request):
 #----- Catalogs this token can see, in effective (token or global) order
 async def _addon_catalogs_for_token(token_data: dict) -> list:
     entries = [
-        {"id": "trending_movies", "name": "TMDB Trending Movies", "type": "movie"},
-        {"id": "trending_series", "name": "TMDB Trending Series", "type": "series"},
-        {"id": "latest_movies", "name": "Latest Movies", "type": "movie"},
-        {"id": "top_movies", "name": "Popular Movies", "type": "movie"},
-        {"id": "latest_series", "name": "Latest Series", "type": "series"},
-        {"id": "top_series", "name": "Popular Series", "type": "series"},
+        {"id": "trending_movies", "name": "TMDB Trending Movies", "type": "movie", "showInHome": False},
+        {"id": "trending_series", "name": "TMDB Trending Series", "type": "series", "showInHome": False},
+        {"id": "latest_movies", "name": "Latest Movies", "type": "movie", "showInHome": False},
+        {"id": "top_movies", "name": "Popular Movies", "type": "movie", "showInHome": False},
+        {"id": "latest_series", "name": "Latest Series", "type": "series", "showInHome": False},
+        {"id": "top_series", "name": "Popular Series", "type": "series", "showInHome": False},
     ]
     try:
         for c in await db.get_custom_catalogs():

@@ -145,11 +145,13 @@ The app is great for personal, single-user use, but it's intentionally lighter t
 
 ### 2. Nuvio Collection & Logo Buttons (Optional)
 
-* **Trending Now:** the `trending_movies` and `trending_series` catalogs use TMDB's daily Trending API for rank order, then intersect those TMDB IDs with accessible Telegram-Stremio database records. A title that is trending on TMDB but missing from the Telegram database is never shown. These results are cached for 15 minutes; during a TMDB outage, the last successful cached ranking is used when available.
+* **Trending Now:** the `trending_movies` and `trending_series` catalogs use TMDB's daily Trending API for rank order, then intersect those TMDB IDs with accessible, playable Telegram-Stremio database records. A title that is trending on TMDB but missing from the Telegram database is never shown. These results are cached for 15 minutes; during a TMDB outage, the last successful cached ranking is used when available.
+* **Nested Trending:** `TMDB Trending Movies` and `TMDB Trending Series` are sources inside `Streaming Services → Trending Now`; the manifest marks them `showInHome: false` to avoid duplicate standalone home rows. The manifest layout version is bumped so Nuvio refreshes its cached catalog definitions after deployment.
 * **Latest / Popular:** remain database-based. Latest is ordered by `updated_on`; Popular is ordered by stored `rating`. They are deliberately not presented as TMDB Trending.
-* **URL:** `https://<YOUR_DOMAIN>/stremio/<TOKEN>/nuvio-collection.json`
-* **File:** The Telegram bot automatically attaches the downloadable `nuvio_collection.json` document on `/start` or subscription approval.
-* Import the URL or JSON file into **Nuvio (Settings ⚙️ → Collections → Import)** to display horizontal **Landscape Logo Buttons** (*Netflix*, *JioHotstar*, *Prime Video*, *Apple TV*, *Bollywood*, *Anime*, *Marvel*, *Star Wars*) on the Nuvio home screen!
+* **Explore & Discover:** folders are generated from TMDB metadata on media already stored and playable in Telegram. Results are served by addon catalogs (`explore_*`) that query the local database; Nuvio does not call TMDB/Trakt lists directly, so unavailable titles are excluded. Existing records are enriched gradually, and new ingested records carry the grouping metadata.
+* **Dynamic collection URL:** `https://<YOUR_DOMAIN>/stremio/<TOKEN>/nuvio-collection.json`
+* Prefer importing the **URL** into Nuvio (Settings ⚙️ → Collections → Import) over importing a downloaded JSON snapshot. A downloaded JSON file is static; the endpoint regenerates which Explore folders are included from the currently available database. Refresh/re-import the URL after an old-record metadata backfill completes or when you need newly detected collection folders added to the imported layout. Catalog contents inside an existing folder are read from MongoDB on each catalog request.
+* **File:** The Telegram bot may attach a generated `nuvio_collection.json` document on `/start` or subscription approval; treat the attachment as a snapshot, not a live-updating configuration.
 
 > ⚠️ **Important for Server Hosts:**  
 > For Nuvio collections to populate platform-specific titles (instead of falling back to default latest movies/series), make sure to enable the **Auto Catalogs** (**Netflix, Hotstar, Prime Video, Apple TV, Bollywood, etc.**) under **Dashboard → Catalogs** and click **Sync**.
@@ -938,3 +940,11 @@ If Telegram-Stremio is useful to you, you can support its development here:
 <sub>Want to help? Open an issue or a pull request.</sub>
 
 </div>
+
+
+### Database-only Trending and Explore catalogs
+
+* `Streaming Services → Trending Now` contains TMDB daily-trending movies/series plus the existing Latest and Popular tabs. TMDB results are intersected with playable, visible Telegram records and retain TMDB order.
+* TMDB Trending and database-only Explore/franchise catalogs are still declared in the manifest for collection resolution, but use a required `search` extra so Nuvio's home-catalog builder does not add duplicate standalone rows. The addon layout version is bumped when that behavior changes.
+* The hosted `/stremio/<TOKEN>/nuvio-collection.json` endpoint generates Explore folders from the current accessible library. Explore membership is based on stored TMDB collection/company/network/keyword/country/language metadata; catalog responses only return playable Telegram DB records. Existing records are backfilled in batches and new ingested records save the grouping fields.
+* Use the hosted collection URL in Nuvio for dynamic folder membership. A downloaded JSON file is only a snapshot; it cannot add newly discovered folders unless imported/refreshed again.

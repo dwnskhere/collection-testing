@@ -201,7 +201,7 @@ async def details(media_type: str, item_id):
             client = get_tmdb_client()
             async with API_SEMAPHORE:
                 target = client.movie(item_id) if media_type == "movie" else client.tv(item_id)
-                det = await target.details(append_to_response="external_ids,credits")
+                det = await target.details(append_to_response="external_ids,credits,keywords")
                 det.images = await target.images()
             return det
         except Exception as e:
@@ -233,6 +233,78 @@ async def external_imdb_id(media_type: str, tmdb_id) -> str | None:
         return None
 
 
+def _tmdb_value(obj, key: str, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _tmdb_entities(value) -> tuple[list[int], list[str]]:
+    ids: list[int] = []
+    names: list[str] = []
+    for item in value or []:
+        raw_id = _tmdb_value(item, "id")
+        name = _tmdb_value(item, "name")
+        try:
+            if raw_id is not None:
+                parsed_id = int(raw_id)
+                if parsed_id > 0 and parsed_id not in ids:
+                    ids.append(parsed_id)
+        except (TypeError, ValueError):
+            pass
+        if name:
+            normalized = str(name).strip()
+            if normalized and normalized not in names:
+                names.append(normalized)
+    return ids, names
+
+
+def _tmdb_keyword_names(item) -> list[str]:
+    keywords = _tmdb_value(item, "keywords") or []
+    if isinstance(keywords, dict):
+        keywords = keywords.get("keywords") or keywords.get("results") or []
+    elif not isinstance(keywords, (list, tuple)):
+        nested = _tmdb_value(keywords, "keywords") or _tmdb_value(keywords, "results")
+        if nested is not None:
+            keywords = nested
+        else:
+            try:
+                keywords = list(keywords)
+            except TypeError:
+                keywords = []
+    names: list[str] = []
+    for keyword in keywords:
+        name = _tmdb_value(keyword, "name")
+        if name:
+            clean = str(name).strip()
+            if clean and clean not in names:
+                names.append(clean)
+    return names
+
+
+def _tmdb_grouping_fields(item, media_type: str) -> dict:
+    collection = _tmdb_value(item, "belongs_to_collection") if media_type == "movie" else None
+    collection_id = _tmdb_value(collection, "id") if collection else None
+    try:
+        collection_id = int(collection_id) if collection_id is not None else None
+    except (TypeError, ValueError):
+        collection_id = None
+    company_ids, company_names = _tmdb_entities(_tmdb_value(item, "production_companies", []))
+    network_ids, network_names = _tmdb_entities(_tmdb_value(item, "networks", []))
+    return {
+        "tmdb_collection_id": collection_id,
+        "tmdb_collection_name": _tmdb_value(collection, "name") if collection else None,
+        "tmdb_collection_poster": format_tmdb_image(_tmdb_value(collection, "poster_path")) if collection else "",
+        "tmdb_collection_backdrop": format_tmdb_image(_tmdb_value(collection, "backdrop_path"), "original") if collection else "",
+        "tmdb_company_ids": company_ids,
+        "tmdb_company_names": company_names,
+        "tmdb_network_ids": network_ids,
+        "tmdb_network_names": network_names,
+        "tmdb_keywords": _tmdb_keyword_names(item),
+        "tmdb_grouping_checked": True,
+    }
+
+
 def build_movie_payload(movie, quality, encoded_string) -> dict:
     release = getattr(movie, "release_date", None)
     title = movie.title or getattr(movie, "original_title", "") or ""
@@ -258,6 +330,7 @@ def build_movie_payload(movie, quality, encoded_string) -> dict:
         "genres": [g.name for g in (movie.genres or [])],
         "original_language": getattr(movie, "original_language", None),
         "origin_country": _tmdb_country_codes(movie),
+        **_tmdb_grouping_fields(movie, "movie"),
         "quality": quality,
         "encoded_string": encoded_string,
     }
@@ -297,6 +370,7 @@ def build_tv_payload(tv, ep, season, episode, quality, encoded_string) -> dict:
         "runtime": str(runtime),
         "original_language": getattr(tv, "original_language", None),
         "origin_country": _tmdb_country_codes(tv),
+        **_tmdb_grouping_fields(tv, "tv"),
         "season_number": season,
         "episode_number": episode,
         "episode_title": getattr(ep, "name", fallback_ep_title) if ep else fallback_ep_title,

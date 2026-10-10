@@ -1320,6 +1320,16 @@ class Database:
                 is_anime=metadata_info.get('is_anime', False),
                 original_language=metadata_info.get('original_language'),
                 origin_country=metadata_info.get('origin_country', []) or [],
+                tmdb_collection_id=metadata_info.get('tmdb_collection_id'),
+                tmdb_collection_name=metadata_info.get('tmdb_collection_name'),
+                tmdb_collection_poster=metadata_info.get('tmdb_collection_poster'),
+                tmdb_collection_backdrop=metadata_info.get('tmdb_collection_backdrop'),
+                tmdb_company_ids=metadata_info.get('tmdb_company_ids', []) or [],
+                tmdb_company_names=metadata_info.get('tmdb_company_names', []) or [],
+                tmdb_network_ids=metadata_info.get('tmdb_network_ids', []) or [],
+                tmdb_network_names=metadata_info.get('tmdb_network_names', []) or [],
+                tmdb_keywords=metadata_info.get('tmdb_keywords', []) or [],
+                tmdb_grouping_checked=metadata_info.get('tmdb_grouping_checked'),
                 telegram=[quality_detail]
             )
             return await self.update_movie(media, status)
@@ -1346,6 +1356,16 @@ class Database:
                 is_anime=metadata_info.get('is_anime', False),
                 original_language=metadata_info.get('original_language'),
                 origin_country=metadata_info.get('origin_country', []) or [],
+                tmdb_collection_id=metadata_info.get('tmdb_collection_id'),
+                tmdb_collection_name=metadata_info.get('tmdb_collection_name'),
+                tmdb_collection_poster=metadata_info.get('tmdb_collection_poster'),
+                tmdb_collection_backdrop=metadata_info.get('tmdb_collection_backdrop'),
+                tmdb_company_ids=metadata_info.get('tmdb_company_ids', []) or [],
+                tmdb_company_names=metadata_info.get('tmdb_company_names', []) or [],
+                tmdb_network_ids=metadata_info.get('tmdb_network_ids', []) or [],
+                tmdb_network_names=metadata_info.get('tmdb_network_names', []) or [],
+                tmdb_keywords=metadata_info.get('tmdb_keywords', []) or [],
+                tmdb_grouping_checked=metadata_info.get('tmdb_grouping_checked'),
                 seasons=[Season(
                     season_number=metadata_info['season_number'],
                     episodes=[Episode(
@@ -1520,6 +1540,20 @@ class Database:
             existing_movie["kitsu_id"] = kitsu_id
         if movie_dict.get("is_anime"):
             existing_movie["is_anime"] = True
+        _group_fields = (
+            "tmdb_collection_id", "tmdb_collection_name", "tmdb_collection_poster",
+            "tmdb_collection_backdrop", "tmdb_company_ids", "tmdb_company_names",
+            "tmdb_network_ids", "tmdb_network_names", "tmdb_keywords",
+        )
+        if movie_dict.get("tmdb_grouping_checked") is True:
+            for _field in _group_fields:
+                existing_movie[_field] = movie_dict.get(_field)
+            existing_movie["tmdb_grouping_checked"] = True
+        else:
+            for _field in _group_fields:
+                _value = movie_dict.get(_field)
+                if _value not in (None, "", [], {}):
+                    existing_movie[_field] = _value
 
         existing_qualities = existing_movie.get("telegram", [])
 
@@ -1590,6 +1624,20 @@ class Database:
             existing_tv["kitsu_id"] = kitsu_id
         if tv_show_dict.get("is_anime"):
             existing_tv["is_anime"] = True
+        _group_fields = (
+            "tmdb_collection_id", "tmdb_collection_name", "tmdb_collection_poster",
+            "tmdb_collection_backdrop", "tmdb_company_ids", "tmdb_company_names",
+            "tmdb_network_ids", "tmdb_network_names", "tmdb_keywords",
+        )
+        if tv_show_dict.get("tmdb_grouping_checked") is True:
+            for _field in _group_fields:
+                existing_tv[_field] = tv_show_dict.get(_field)
+            existing_tv["tmdb_grouping_checked"] = True
+        else:
+            for _field in _group_fields:
+                _value = tv_show_dict.get(_field)
+                if _value not in (None, "", [], {}):
+                    existing_tv[_field] = _value
 
         for season in tv_show_dict["seasons"]:
             existing_season = next(
