@@ -682,20 +682,11 @@ async def get_manifest(token: str, token_data: dict = Depends(verify_token)):
         except Exception:
             pass
 
-        # Franchise catalog IDs are dynamic, but they must also be announced in
-        # the manifest so Stremio clients can request them as normal catalogs.
-        try:
-            await _ensure_franchise_metadata_index()
-            for franchise in await _get_available_franchise_groups(token_data):
-                catalogs.append({
-                    "type": "movie",
-                    "id": f"franchise_{franchise['id']}",
-                    "name": franchise["name"],
-                    "extra": [{"name": "search", "isRequired": False}, {"name": "skip"}],
-                    "extraSupported": ["search", "skip"],
-                })
-        except Exception as exc:
-            LOGGER.warning(f"Could not add dynamic franchise catalogs to manifest: {exc}")
+        # Franchise catalogs are intentionally NOT exposed as top-level manifest
+        # catalogs. Nuvio loads them through the dedicated Ultimate Collection
+        # folder below; advertising every franchise here also makes each one show
+        # up as a separate home-screen row, duplicating the curated collection.
+        # The catalog endpoint still handles franchise_<id> requests directly.
 
         try:
             order = await db.get_catalog_order()
@@ -1547,7 +1538,7 @@ async def build_nuvio_collection_data(
                 ]
                 ultimate_folder = {
                     "id": "folder-dynamic-ultimate-collection",
-                    "title": "The Ultimate Collection",
+                    "title": "Browse Franchises",
                     "sources": franchise_sources,
                     "catalogSources": franchise_sources,
                     "hideTitle": False,
@@ -1557,7 +1548,7 @@ async def build_nuvio_collection_data(
                 }
                 franchise_collection = {
                     "id": "collection-dynamic-franchises-community",
-                    "title": "Collections",
+                    "title": "The Ultimate Collection",
                     "folders": [ultimate_folder],
                     "pinToTop": False,
                     "viewMode": "TABBED_GRID",
@@ -1570,7 +1561,7 @@ async def build_nuvio_collection_data(
     if collection_type == "ott":
         return [ott_collection]
     elif collection_type == "explore":
-        return [explore_collection] + ([franchise_collection] if franchise_collection else [])
+        return [explore_collection]
     return [ott_collection, explore_collection] + ([franchise_collection] if franchise_collection else [])
 
 
